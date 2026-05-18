@@ -1153,6 +1153,9 @@ func cmdSetup(args []string) {
 	if err := offerUpdateCheckOptIn(); err != nil {
 		fail(err)
 	}
+	if err := offerYoloAlias(); err != nil {
+		fail(err)
+	}
 	if err := offerConfigSetup(); err != nil {
 		fail(err)
 	}
@@ -1301,6 +1304,69 @@ func offerUpdateCheckOptIn() error {
 func stdinIsTTY() bool {
 	fi, err := os.Stdin.Stat()
 	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+// offerYoloAlias prompts the user to add a `yolo` shell alias for
+// `anthropool --dangerously-skip-permissions` to their shell rc file.
+// POSIX-only (bash/zsh); skips silently on Windows, on non-TTY, when
+// no rc file is found, and when the alias is already present.
+func offerYoloAlias() error {
+	if !stdinIsTTY() || runtime.GOOS == "windows" {
+		return nil
+	}
+	rc := detectShellRC()
+	if rc == "" {
+		return nil
+	}
+	const aliasLine = `alias yolo='anthropool --dangerously-skip-permissions'`
+	if data, err := os.ReadFile(rc); err == nil && strings.Contains(string(data), "alias yolo=") {
+		return nil
+	}
+	fmt.Println()
+	fmt.Printf("Add `yolo` shell alias for `anthropool --dangerously-skip-permissions` to %s? [y/N] ", rc)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer != "y" && answer != "yes" {
+		return nil
+	}
+	f, err := os.OpenFile(rc, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.WriteString("\n" + aliasLine + "\n"); err != nil {
+		return err
+	}
+	fmt.Printf("✓ Added `yolo` alias to %s — open a new shell or run `source %s` to use it\n", rc, rc)
+	return nil
+}
+
+// detectShellRC returns the path to the user's shell rc file based on
+// $SHELL, or "" if none is found. Checks bash and zsh only.
+func detectShellRC() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	var candidates []string
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		candidates = []string{".zshrc"}
+	case "bash":
+		candidates = []string{".bashrc", ".bash_profile"}
+	default:
+		candidates = []string{".zshrc", ".bashrc", ".bash_profile"}
+	}
+	for _, c := range candidates {
+		p := filepath.Join(home, c)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 func cmdUpgrade(args []string) {
