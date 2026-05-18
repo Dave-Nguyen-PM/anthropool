@@ -1,0 +1,206 @@
+// Postinstall: detect platform and download the matching anthropool binary
+// from the GitHub release that matches this package's version.
+//
+// Pattern follows esbuild / swc / biome — the npm package is a thin
+// wrapper around a precompiled Go binary. No native compile, no extra
+// runtime deps; Node 18+ is enough thanks to global fetch.
+//
+// Failure here does not abort `npm install` for the rest of the
+// dependency tree; we exit 0 so peers don't blow up. The bin shim
+// detects a missing binary at runtime and prints a clear error.
+
+import { createWriteStream, existsSync, mkdirSync, chmodSync, createReadStream, readFileSync } from "node:fs";
+import { delimiter, dirname, resolve, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
+import { pipeline } from "node:stream/promises";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
+const version = pkg.version;
+const docsURL = "https://anthropool.dave.com/docs";
+const supportURL = "https://support.dave.com";
+
+// Banner. Mirrors internal/branding/branding.go and scripts/install.sh.
+// Suppressed by:
+//   - npm's --silent / loglevel < info (we go through console.error so
+//     it lands in postinstall output by default)
+//   - the user setting ANTHROPOOL_NO_BANNER=1
+//   - non-TTY stderr — we don't want this leaking into CI logs unprompted
+function printBanner() {
+  if (process.env.ANTHROPOOL_NO_BANNER) return;
+  if (!process.stderr.isTTY) return;
+  // Use ASCII fallback on Windows unless the user opted in: legacy
+  // conhost can mangle the Unicode box-drawing glyphs.
+  const unicode =
+    process.platform !== "win32" ||
+    (process.env.ANTHROPOOL_BANNER || "").toLowerCase() === "unicode";
+  const art = unicode
+    ? [
+        "",
+        "  ██████╗ ██╗   ██╗ ██╗  ██╗",
+        " ██╔════╝ ██║   ██║ ╚██╗██╔╝",
+        " ██║      ██║   ██║  ╚███╔╝",
+        " ██║      ██║   ██║  ██╔██╗",
+        " ╚██████╗ ╚██████╔╝ ██╔╝ ██╗",
+        "  ╚═════╝  ╚═════╝  ╚═╝  ╚═╝",
+        "",
+      ]
+    : [
+        "",
+        " ##### ##  ##  ##  ##",
+        "##     ##  ##   ####",
+        "##     ##  ##    ##",
+        "##     ##  ##   ####",
+        " #####  ####    ##  ##",
+        "",
+      ];
+  console.error(art.join("\n"));
+  console.error(" ANTHROPOOL: Run multiple Claude Code Pro/Max accounts as one\n");
+}
+
+printBanner();
+
+// Map Node's platform / arch identifiers to the Go release artefact
+// names produced by the anthropool release workflow.
+const targets = {
+  "linux-x64": "anthropool-linux-amd64",
+  "linux-arm64": "anthropool-linux-arm64",
+  "darwin-x64": "anthropool-darwin-amd64",
+  "darwin-arm64": "anthropool-darwin-arm64",
+  "win32-x64": "anthropool-windows-amd64.exe",
+};
+
+const key = `${process.platform}-${process.arch}`;
+const asset = targets[key];
+
+if (!asset) {
+  console.error(
+    `anthropool: no prebuilt binary for ${key}. ` +
+    "Open an issue at https://github.com/Dave-Nguyen-PM/anthropool/issues, " +
+    "or build from source: https://github.com/Dave-Nguyen-PM/anthropool#building-from-source",
+  );
+  process.exit(0); // soft-fail; peers shouldn't break
+}
+
+const repo = process.env.ANTHROPOOL_RELEASE_REPO || "Dave-Nguyen-PM/anthropool";
+const baseURL = `https://github.com/${repo}/releases/download/v${version}`;
+
+const binDir = join(here, "bin");
+const binPath = join(binDir, process.platform === "win32" ? "anthropool.exe" : "anthropool");
+const sumPath = `${binPath}.sha256`;
+
+if (!existsSync(binDir)) {
+  mkdirSync(binDir, { recursive: true });
+}
+
+async function download(url, dest) {
+  const r = await fetch(url, { redirect: "follow" });
+  if (!r.ok) {
+    throw new Error(`HTTP ${r.status} fetching ${url}`);
+  }
+  await pipeline(r.body, createWriteStream(dest));
+}
+
+async function sha256(path) {
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(path), hash);
+  return hash.digest("hex");
+}
+
+function pathEnvValue() {
+  return process.env.PATH || process.env.Path || process.env.path || "";
+}
+
+function pathContainsDir(dir) {
+  if (!dir) return false;
+  const want = normalizePathDir(dir);
+  return pathEnvValue()
+    .split(delimiter)
+    .filter(Boolean)
+    .some((entry) => normalizePathDir(entry) === want);
+}
+
+function normalizePathDir(dir) {
+  let out = dir;
+  if (process.platform === "win32") {
+    out = out.replace(/%([^%]+)%/g, (_, name) => process.env[name] || `%${name}%`);
+  }
+  out = resolve(out).replace(/[\\/]+$/, "");
+  if (process.platform === "win32") {
+    out = out.toLowerCase();
+  }
+  return out;
+}
+
+function npmGlobalBinHint() {
+  if (process.platform !== "win32") return;
+  if (process.env.npm_config_global !== "true") return;
+
+  const prefix = process.env.npm_config_prefix;
+  if (!prefix || pathContainsDir(prefix)) return;
+
+  console.error("");
+  console.error("anthropool: Windows PATH note");
+  console.error("  npm installed anthropool, but npm's global command folder is not on Path:");
+  console.error(`    ${prefix}`);
+  console.error("");
+  console.error("  Temporary fix for this terminal:");
+  console.error("    set PATH=%PATH%;%APPDATA%\\npm");
+  console.error("");
+  console.error("  Permanent fix:");
+  console.error("    Add the folder above to User Path, then open a new terminal.");
+  console.error(`    ${docsURL}`);
+}
+
+function printNextSteps() {
+  console.error("");
+  console.error("anthropool: next steps");
+  console.error("  1. Run `anthropool setup` to install /switch, /anthropool:* and Claude Code hooks.");
+  console.error("  2. Run `anthropool add` while logged in to each Claude account.");
+  console.error("  3. Start Claude with `anthropool` instead of `claude`.");
+  console.error("");
+  console.error(`Docs: ${docsURL}`);
+  console.error(`Support development: ${supportURL}`);
+  npmGlobalBinHint();
+}
+
+async function main() {
+  const binURL = `${baseURL}/${asset}`;
+  const sumURL = `${binURL}.sha256`;
+  console.error(`anthropool: downloading ${asset} from ${binURL}`);
+  await download(binURL, binPath);
+
+  // The release workflow publishes a sibling .sha256. Verifying it is
+  // a cheap defence against transport corruption and a basic supply-chain
+  // sanity check; if the sidecar is missing we still proceed (older
+  // releases may not have it) but warn.
+  try {
+    await download(sumURL, sumPath);
+    const expected = readFileSync(sumPath, "utf8").trim().split(/\s+/)[0];
+    const actual = await sha256(binPath);
+    if (expected && actual !== expected) {
+      console.error(
+        `anthropool: SHA256 mismatch on downloaded binary (expected ${expected}, got ${actual}).`,
+      );
+      process.exit(0); // soft-fail; bin shim will surface a clearer error
+    }
+  } catch (e) {
+    console.error(`anthropool: skipping checksum verification (${e.message})`);
+  }
+
+  if (process.platform !== "win32") {
+    chmodSync(binPath, 0o755);
+  }
+  console.error(`anthropool ${version} installed at ${binPath}`);
+  printNextSteps();
+}
+
+main().catch((e) => {
+  console.error(`anthropool: postinstall failed: ${e.message || e}`);
+  console.error(
+    "If this persists, you can grab the binary directly from " +
+    `https://github.com/${repo}/releases/tag/v${version}`,
+  );
+  process.exit(0); // soft-fail per pattern above
+});

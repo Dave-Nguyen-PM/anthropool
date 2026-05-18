@@ -1,0 +1,53 @@
+{
+  "name": "@Dave-Nguyen-PM/anthropool",
+  "version": "0.2.6",
+  "description": "Run multiple Claude Code accounts as one",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "cli",
+    "account",
+    "switcher",
+    "oauth"
+  ],
+  "homepage": "https://anthropool.dave.com",
+  "funding": {
+    "type": "individual",
+    "url": "https://support.dave.com"
+  },
+  "bugs": {
+    "url": "https://github.com/Dave-Nguyen-PM/anthropool/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dave-Nguyen-PM/anthropool.git"
+  },
+  "license": "GPL-3.0-only",
+  "author": "dave",
+  "type": "module",
+  "bin": {
+    "anthropool": "bin/anthropool.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

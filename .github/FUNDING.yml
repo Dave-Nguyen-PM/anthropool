@@ -1,0 +1,6 @@
+# Renders the "Sponsor" button on the repo page. GitHub Sponsors is
+# the primary channel; the custom landing page stays as a fallback so
+# new payment options can be added without rotating any URL embedded
+# in users' browsers, READMEs or stars.
+github: [dave]
+custom: ["https://support.dave.com"]

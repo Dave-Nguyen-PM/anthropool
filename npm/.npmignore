@@ -1,0 +1,10 @@
+# Binaries are downloaded by postinstall into bin/, never published.
+bin/anthropool
+bin/anthropool.exe
+bin/anthropool.exe.sha256
+bin/anthropool.sha256
+
+# Local dev junk
+node_modules/
+.DS_Store
+*.tgz

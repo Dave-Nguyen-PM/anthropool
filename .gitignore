@@ -1,0 +1,26 @@
+# compiled binary release artefacts (root-only — assets/anthropool-*.svg are tracked)
+/anthropool
+/anthropool-*
+*.exe
+*.sha256
+
+# editor
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# rendered logo previews — only the SVG sources are kept in the repo
+assets/*-preview.*
+
+# npm wrapper local artefacts
+npm/bin/anthropool
+npm/bin/anthropool.exe
+npm/bin/*.sha256
+npm/node_modules/
+PLAN.md
+PROGRESS.md
+/.ccache
+/.gocache

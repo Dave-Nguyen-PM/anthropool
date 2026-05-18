@@ -1,0 +1,1646 @@
+// anthropool — Run multiple Claude Code Pro/Max accounts as one.
+//
+// Daily-driver entry point: run `anthropool` instead of `claude`. anthropool wraps
+// the real `claude` binary and consumes the Stop / SessionStart /
+// PostToolUseFailure hooks so a `/switch <account>` slash command —
+// or a rate-limit error from the API — can swap the active account
+// and re-launch claude on the same conversation, without restarting
+// the terminal.
+//
+// Subcommands manage the local set of saved accounts. Anything that
+// isn't a known subcommand is passed straight through to `claude`.
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Dave-Nguyen-PM/anthropool/internal/branding"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/config"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/history"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/hookinstall"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/hooks"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/monitor"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/paths"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/store"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/switcher"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/updater"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/usage"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/wrapper"
+	"golang.org/x/term"
+)
+
+const (
+	version = "0.2.5"
+	// donateURL is shown only by `anthropool version --verbose`. Subtle by
+	// design — never printed during normal use, never injected into
+	// help output, never shown by the wrapper or the slash command.
+	donateURL = "https://support.dave.com"
+)
+
+// knownSubcommands is the set of first-args anthropool handles itself.
+// Anything else (including `--resume`, `mcp`, `-c`, etc.) is forwarded
+// to the real claude binary via the wrapper.
+var knownSubcommands = map[string]bool{
+	"add":             true,
+	"list":            true,
+	"ls":              true,
+	"remove":          true,
+	"rm":              true,
+	"status":          true,
+	"support":         true,
+	"switch":          true,
+	"force-switch":    true,
+	"rescue-switch":   true,
+	"setup":           true,
+	"install-hooks":   true,
+	"uninstall-hooks": true,
+	"hook":            true,
+	"history":         true,
+	"config":          true,
+	"usage":           true,
+	"upgrade":         true,
+	"run":             true,
+	"docs":            true,
+	"help":            true,
+	"--help":          true,
+	"-h":              true,
+	"version":         true,
+	"--version":       true,
+	"__slash-switch":  true,
+}
+
+func main() {
+	initTerminalOutput()
+
+	if len(os.Args) < 2 {
+		runWrapper(nil)
+		return
+	}
+
+	cmd := os.Args[1]
+	rest := os.Args[2:]
+
+	if !knownSubcommands[cmd] {
+		runWrapper(os.Args[1:])
+		return
+	}
+
+	switch cmd {
+	case "add":
+		cmdAdd(rest)
+	case "list", "ls":
+		cmdList(rest)
+	case "remove", "rm":
+		cmdRemove(rest)
+	case "status":
+		cmdStatus(rest)
+	case "support":
+		cmdSupport(rest)
+	case "switch":
+		cmdSwitch(rest)
+	case "force-switch", "rescue-switch":
+		cmdForceSwitch(rest)
+	case "setup":
+		cmdSetup(rest)
+	case "install-hooks":
+		cmdInstallHooks(rest)
+	case "uninstall-hooks":
+		cmdUninstallHooks(rest)
+	case "hook":
+		cmdHook(rest)
+	case "history":
+		cmdHistory(rest)
+	case "config":
+		cmdConfig(rest)
+	case "usage":
+		cmdUsage(rest)
+	case "upgrade":
+		cmdUpgrade(rest)
+	case "run":
+		runWrapper(rest)
+	case "docs":
+		cmdDocs(rest)
+	case "help", "--help", "-h":
+		printHelp()
+	case "version", "--version":
+		cmdVersion(rest)
+	case "__slash-switch":
+		cmdSlashSwitch(rest)
+	}
+}
+
+// --- Account-management subcommands --------------------------------------
+
+func cmdAdd(args []string) {
+	fs := flag.NewFlagSet("add", flag.ExitOnError)
+	slot := fs.Int("slot", 0, "specific slot number (default: next free)")
+	_ = fs.Parse(args)
+
+	acct, refreshed, err := switcher.AddCurrent(*slot)
+	if err != nil {
+		fail(err)
+	}
+	if refreshed {
+		fmt.Printf("Refreshed slot %d (%s).\n", acct.Slot, acct.Email)
+	} else {
+		fmt.Printf("Added slot %d (%s).\n", acct.Slot, acct.Email)
+	}
+}
+
+func cmdList(args []string) {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	refresh := fs.Bool("refresh", false, "fetch fresh usage before listing")
+	_ = fs.Parse(args)
+
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	if len(state.Accounts) == 0 {
+		fmt.Println("No accounts managed yet. Run `anthropool add` while logged in.")
+		return
+	}
+
+	if *refresh {
+		_, errs := monitor.RefreshAll()
+		for _, e := range errs {
+			fmt.Fprintln(os.Stderr, "warning:", e)
+		}
+	}
+
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
+	}
+	liveEmail, _ := switcher.CurrentLiveEmail()
+
+	cfg, _ := config.Load()
+	setTheme(cfg.Theme)
+
+	printFancyHeader(os.Stdout, state, liveEmail)
+	printAccountTable(os.Stdout, state, liveEmail, cache)
+
+	if !*refresh && len(cache) == 0 {
+		fmt.Printf("\n %s(No usage data — run `anthropool list --refresh` or `anthropool usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
+	}
+}
+
+func windowPct(w *usage.Window) string {
+	if w == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%.0f%%", w.Utilization)
+}
+
+// nextReset returns the soonest reset time across the populated
+// windows, formatted as a human-friendly relative duration. We render
+// "1h32m", "2d", or "—" for missing data.
+func nextReset(u usage.AccountUsage) string {
+	var soonest *time.Time
+	for _, w := range []*usage.Window{u.FiveHour, u.SevenDay} {
+		if w == nil || w.ResetsAt == nil {
+			continue
+		}
+		if soonest == nil || w.ResetsAt.Before(*soonest) {
+			t := *w.ResetsAt
+			soonest = &t
+		}
+	}
+	if soonest == nil {
+		return "—"
+	}
+	d := time.Until(*soonest)
+	if d <= 0 {
+		return "now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
+}
+
+func cmdRemove(args []string) {
+	fs := flag.NewFlagSet("remove", flag.ExitOnError)
+	force := fs.Bool("force", false, "remove even if active")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool remove [--force] <slot|email>")
+		os.Exit(2)
+	}
+	acct, err := switcher.Remove(fs.Arg(0), *force)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("Removed slot %d (%s).\n", acct.Slot, acct.Email)
+}
+
+func cmdStatus(args []string) {
+	cfg, _ := config.Load()
+	setTheme(cfg.Theme)
+
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	liveEmail, liveErr := switcher.CurrentLiveEmail()
+	if liveErr != nil {
+		liveEmail = ""
+	}
+
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
+	}
+
+	printFancyHeader(os.Stdout, state, liveEmail)
+	if len(state.Accounts) > 0 {
+		printAccountTable(os.Stdout, state, liveEmail, cache)
+		if len(cache) == 0 {
+			fmt.Printf("\n %s(No usage data — run `anthropool usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
+		}
+	} else {
+		fmt.Printf(" %sNo accounts managed yet. Run `anthropool add` while logged in.%s\n\n", colorGray, colorReset)
+	}
+}
+
+func cmdSwitch(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool switch <slot|email>")
+		os.Exit(2)
+	}
+	from, to, err := switcher.SwitchTo(args[0])
+	if err != nil {
+		fail(err)
+	}
+	if from.Email != "" {
+		fmt.Printf("Switched %s → %s.\n", from.Email, to.Email)
+	} else {
+		fmt.Printf("Switched to %s.\n", to.Email)
+	}
+	if os.Getenv("ANTHROPOOL_WRAPPED") == "" {
+		fmt.Println("Restart Claude Code to apply the change.")
+		fmt.Println("(For inline switching from inside Claude, run `anthropool setup` and use `/switch` next time.)")
+	}
+}
+
+func cmdSlashSwitch(args []string) {
+	target := strings.TrimSpace(strings.Join(args, " "))
+	if err := wrapper.SlashSwitch(target, os.Stdout); err != nil {
+		fail(err)
+	}
+}
+
+func cmdForceSwitch(args []string) {
+	if len(args) > 1 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool force-switch [slot|email]")
+		os.Exit(2)
+	}
+	target := strings.TrimSpace(strings.Join(args, " "))
+	if err := wrapper.ForceSwitch(target, os.Stdout); err != nil {
+		fail(err)
+	}
+}
+
+// --- Hook subcommands ----------------------------------------------------
+
+// cmdHook dispatches `anthropool hook {prompt-submit,stop,session-start,rate-limit}`. These
+// are invoked by Claude Code itself via entries in
+// ~/.claude/settings.json. They read JSON from stdin and write a
+// signal file under the anthropool runtime directory; everything else is
+// done by the wrapper's poll loop.
+func cmdHook(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool hook {prompt-submit|stop|session-start|rate-limit}")
+		os.Exit(2)
+	}
+	var err error
+	switch args[0] {
+	case "prompt-submit":
+		err = hooks.UserPromptSubmit(os.Stdin, os.Stdout)
+	case "stop":
+		err = hooks.Stop(os.Stdin)
+	case "session-start":
+		err = hooks.SessionStart(os.Stdin)
+	case "rate-limit":
+		err = hooks.RateLimit(os.Stdin)
+	default:
+		fmt.Fprintf(os.Stderr, "anthropool: unknown hook %q\n", args[0])
+		os.Exit(2)
+	}
+	if err != nil {
+		// Hooks should not break Claude Code on a transient failure;
+		// log and exit 0 so the user's session keeps running.
+		fmt.Fprintf(os.Stderr, "anthropool hook %s: %v\n", args[0], err)
+	}
+}
+
+func cmdInstallHooks(args []string) {
+	resolved, perr := hookinstall.VerifyOnPATH()
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, "warning:", perr)
+		fmt.Fprintln(os.Stderr, "         hooks installed in settings.json will only work once `anthropool` is on PATH.")
+	} else {
+		fmt.Println("anthropool on PATH:", resolved)
+	}
+	changed, err := hookinstall.Install()
+	if err != nil {
+		fail(err)
+	}
+	if len(changed) == 0 {
+		fmt.Println("All anthropool hooks already installed in ~/.claude/settings.json.")
+	} else {
+		fmt.Printf("Installed/updated hooks in ~/.claude/settings.json: %s\n", strings.Join(changed, ", "))
+		fmt.Println("Restart Claude Code for the new hooks to take effect.")
+	}
+}
+
+func cmdUninstallHooks(args []string) {
+	removed, err := hookinstall.Uninstall()
+	if err != nil {
+		fail(err)
+	}
+	if len(removed) == 0 {
+		fmt.Println("No anthropool hooks present in ~/.claude/settings.json.")
+	} else {
+		fmt.Printf("Removed anthropool hooks: %s\n", strings.Join(removed, ", "))
+	}
+}
+
+// cmdVersion prints the version. With --verbose it appends a single
+// gentle line about supporting development. We deliberately keep the
+// donate hint out of the default `anthropool version` output and out of every
+// other surface (help, list, status, slash command) — the user asked
+// for "subtle, not invasive" and that is what this hits.
+func cmdVersion(args []string) {
+	verbose := false
+	for _, a := range args {
+		if a == "-v" || a == "--verbose" {
+			verbose = true
+		}
+	}
+	fmt.Println("anthropool", version)
+	if verbose {
+		fmt.Println()
+		fmt.Println("If anthropool saves you time, you can support development at", donateURL)
+	}
+}
+
+func cmdSupport(args []string) {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool support")
+		os.Exit(2)
+	}
+	fmt.Print(renderSupport(ansiEnabled))
+}
+
+func cmdDocs(args []string) {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool docs")
+		os.Exit(2)
+	}
+	fmt.Print(renderDocs(ansiEnabled))
+}
+
+func renderDocs(useANSI bool) string {
+	var b strings.Builder
+	b.WriteString(":: A N T H R O P O O L   D O C S ::\n\n")
+	b.WriteString("Full documentation:\n")
+	b.WriteString("  https://anthropool.dave.com/docs\n\n")
+	b.WriteString("Topics covered:\n")
+	b.WriteString("  · Installation (npm, shell, manual binary)\n")
+	b.WriteString("  · Windows, macOS, Linux edge cases\n")
+	b.WriteString("  · Troubleshooting (PATH fix, postinstall failures)\n")
+	b.WriteString("  · Configuration reference\n")
+	b.WriteString("  · Command reference\n")
+	return b.String()
+}
+
+// --- History / Config / Usage --------------------------------------------
+
+func cmdHistory(args []string) {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	n := fs.Int("n", 20, "show the last N entries")
+	clear := fs.Bool("clear", false, "delete the entire swap history")
+	jsonOut := fs.Bool("json", false, "emit entries as one JSON document")
+	_ = fs.Parse(args)
+
+	if *clear {
+		if err := history.Clear(); err != nil {
+			fail(err)
+		}
+		fmt.Println("Cleared swap history.")
+		return
+	}
+
+	entries, err := history.Tail(*n)
+	if err != nil {
+		fail(err)
+	}
+	if len(entries) == 0 {
+		fmt.Println("No swap history yet.")
+		return
+	}
+	if *jsonOut {
+		out, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(string(out))
+		return
+	}
+	for _, e := range entries {
+		fmt.Printf("%s  %s → %s  [%s]\n",
+			e.Timestamp.Local().Format("2006-01-02 15:04:05"),
+			e.From, e.To, e.Trigger)
+		if e.Reason != "" {
+			fmt.Printf("    reason: %s\n", e.Reason)
+		}
+		// Only show usage figures when at least one was nonzero —
+		// fresh installs would otherwise print a row of zeros that
+		// looks like real data.
+		if e.FromUsage5h+e.FromUsage7d+e.ToUsage5h+e.ToUsage7d > 0 {
+			fmt.Printf("    usage: %s 5h:%.0f%% 7d:%.0f%% → %s 5h:%.0f%% 7d:%.0f%%\n",
+				e.From, e.FromUsage5h, e.FromUsage7d,
+				e.To, e.ToUsage5h, e.ToUsage7d)
+		}
+		if e.SessionID != "" {
+			fmt.Printf("    session: %s\n", e.SessionID)
+		}
+	}
+}
+
+func cmdConfig(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool config show | anthropool config keys | anthropool config edit | anthropool config set <key> <value>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "show":
+		c, err := config.Load()
+		if err != nil {
+			fail(err)
+		}
+		out, err := json.MarshalIndent(c, "", "  ")
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(string(out))
+	case "keys":
+		c, err := config.Load()
+		if err != nil {
+			fail(err)
+		}
+		keys := config.Keys(c)
+		// Compute column widths once so the output lines up.
+		var keyW, curW int
+		for _, k := range keys {
+			if l := len(k.Key); l > keyW {
+				keyW = l
+			}
+			if l := len(k.Current); l > curW {
+				curW = l
+			}
+		}
+		if curW > 30 {
+			curW = 30
+		}
+		fmt.Printf("%-*s  %-*s  %s\n", keyW, "KEY", curW, "CURRENT", "DESCRIPTION (default)")
+		for _, k := range keys {
+			cur := k.Current
+			if len(cur) > curW {
+				cur = cur[:curW-1] + "…"
+			}
+			fmt.Printf("%-*s  %-*s  %s (default: %s)\n", keyW, k.Key, curW, cur, k.Description, k.Default)
+		}
+	case "edit":
+		if err := editConfigInteractive(); err != nil {
+			fail(err)
+		}
+	case "set":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: anthropool config set <key> <value>")
+			os.Exit(2)
+		}
+		c, err := config.Load()
+		if err != nil {
+			fail(err)
+		}
+		c, err = config.Set(c, args[1], args[2])
+		if err != nil {
+			fail(err)
+		}
+		if err := config.Save(c); err != nil {
+			fail(err)
+		}
+		fmt.Printf("Set %s.\n", args[1])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: anthropool config show | anthropool config keys | anthropool config edit | anthropool config set <key> <value>")
+		os.Exit(2)
+	}
+}
+
+func editConfigInteractive() error {
+	reader := bufio.NewReader(os.Stdin)
+	raw, err := newRawMenu()
+	if err != nil {
+		return err
+	}
+	defer raw.Close()
+	for {
+		c, err := config.Load()
+		if err != nil {
+			return err
+		}
+		setTheme(c.Theme)
+		printConfigEditor(c)
+		fmt.Print("Select setting, Esc/q=exit: ")
+		choice, err := readEditorChoice(raw, reader)
+		if err != nil {
+			return err
+		}
+		choice = normalizeEditorChoice(choice)
+		switch choice {
+		case "", "s", "save", "q", "quit":
+			fmt.Println("Settings saved.")
+			return nil
+		case "1":
+			v, ok, err := promptValue(raw, reader, "5h threshold %", strconv.Itoa(c.Thresholds.FiveHour))
+			if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if err := setAndSaveConfig("thresholds.five_hour", v); err != nil {
+				fmt.Printf("error: %v\r\n", err)
+				waitEnter(reader)
+			}
+		case "2":
+			v, ok, err := promptValue(raw, reader, "7d threshold %", strconv.Itoa(c.Thresholds.SevenDay))
+			if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if err := setAndSaveConfig("thresholds.seven_day", v); err != nil {
+				fmt.Printf("error: %v\r\n", err)
+				waitEnter(reader)
+			}
+		case "3":
+			next := map[string]string{"drain": "balanced", "balanced": "manual", "manual": "drain"}[strings.ToLower(c.Strategy.Kind)]
+			if next == "" {
+				next = "drain"
+			}
+			if err := setAndSaveConfig("strategy.kind", next); err != nil {
+				return err
+			}
+		case "4":
+			v, ok, err := promptValue(raw, reader, "drain order (comma-separated emails, blank = auto)", strings.Join(c.Strategy.Order, ","))
+			if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if err := setAndSaveConfig("strategy.order", v); err != nil {
+				fmt.Printf("error: %v\r\n", err)
+				waitEnter(reader)
+			}
+		case "5":
+			if err := setAndSaveConfig("auto_switch_on_threshold", strconv.FormatBool(!c.AutoSwitchOnThreshold)); err != nil {
+				return err
+			}
+		case "6":
+			if err := setAndSaveConfig("auto_switch_on_rate_limit", strconv.FormatBool(!c.AutoSwitchOnRateLimit)); err != nil {
+				return err
+			}
+		case "7":
+			if err := setAndSaveConfig("auto_resume", strconv.FormatBool(!c.AutoResume)); err != nil {
+				return err
+			}
+		case "8":
+			v, ok, err := promptValue(raw, reader, `resume message (blank = no auto prompt)`, c.AutoMessage)
+			if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if v == "" {
+				v = `""`
+			}
+			if err := setAndSaveConfig("auto_message", v); err != nil {
+				fmt.Printf("error: %v\r\n", err)
+				waitEnter(reader)
+			}
+		case "9":
+			if err := setAndSaveConfig("update_check.enabled", strconv.FormatBool(!c.UpdateCheck.Enabled)); err != nil {
+				return err
+			}
+		case "10":
+			v, ok, err := promptValue(raw, reader, "update cadence hours", strconv.Itoa(c.UpdateCheck.CadenceHours))
+			if err != nil || !ok {
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			if err := setAndSaveConfig("update_check.cadence_hours", v); err != nil {
+				fmt.Printf("error: %v\r\n", err)
+				waitEnter(reader)
+			}
+		case "11":
+			if err := setAndSaveConfig("notify", strconv.FormatBool(!c.Notify)); err != nil {
+				return err
+			}
+		case "12":
+			next := "default"
+			if c.Theme == "default" {
+				next = "claude"
+			}
+			if err := setAndSaveConfig("theme", next); err != nil {
+				return err
+			}
+		default:
+			fmt.Print("Unknown selection.\r\n")
+			waitEnter(reader)
+		}
+	}
+}
+
+func printConfigEditor(c config.Config) {
+	fmt.Print("\033[H\033[2J")
+	fmt.Printf("%s:: A N T H R O P O O L   S E T T I N G S ::%s\r\n\r\n", colorBold, colorReset)
+	fmt.Printf("%sToggle booleans by selecting their number. Numeric/text settings prompt for a value.%s\r\n", colorGray, colorReset)
+	fmt.Printf("%sPress Enter on an empty prompt to go back/cancel. Press Esc or q to exit.%s\r\n\r\n", colorGray, colorReset)
+
+	g := colorGray
+	r := colorReset
+	t := colorTeal
+	b := colorBold
+
+	fmt.Printf("%s┌────┬────────────────────────────┬────────────────────────────┬────────────────────────────────────┐%s\r\n", g, r)
+	fmt.Printf("%s│%s %sID%s %s│%s %sSETTING%s                    %s│%s %sVALUE%s                      %s│%s %sCONTROL%s                            %s│%s\r\n", g, r, b, r, g, r, b, r, g, r, b, r, g, r, b, r, g, r)
+	fmt.Printf("%s├────┼────────────────────────────┼────────────────────────────┼────────────────────────────────────┤%s\r\n", g, r)
+
+	row := func(id int, label, value, control string, isBool bool) {
+		fmt.Printf("%s│%s ", g, r)
+		fmt.Printf("%s%02d%s ", t, id, r)
+		fmt.Printf("%s│%s ", g, r)
+		fmt.Printf("%s%-26s%s ", t, label, r)
+		fmt.Printf("%s│%s ", g, r)
+		if isBool {
+			padding := strings.Repeat(" ", 26-12)
+			fmt.Printf("%s%s", value, padding)
+		} else {
+			fmt.Printf("%s%-26s%s", t, value, r)
+		}
+		fmt.Printf(" %s│%s ", g, r)
+		fmt.Printf("%-34s ", control)
+		fmt.Printf("%s│%s\r\n", g, r)
+	}
+
+	row(1, "5h threshold", strconv.Itoa(c.Thresholds.FiveHour)+"%", "edit percent", false)
+	row(2, "7d threshold", strconv.Itoa(c.Thresholds.SevenDay)+"%", "edit percent", false)
+	row(3, "strategy", c.Strategy.Kind, "cycle drain/balanced/manual", false)
+	row(4, "drain order", clip(strings.Join(c.Strategy.Order, ","), 26), "edit comma-separated emails", false)
+	row(5, "threshold auto-switch", checkbox(c.AutoSwitchOnThreshold), "toggle", true)
+	row(6, "rate-limit auto-switch", checkbox(c.AutoSwitchOnRateLimit), "toggle", true)
+	row(7, "auto resume", checkbox(c.AutoResume), "toggle", true)
+	row(8, "resume message", clip(displayEmpty(c.AutoMessage), 26), "edit text", false)
+	row(9, "update check", checkbox(c.UpdateCheck.Enabled), "toggle", true)
+	row(10, "update cadence", strconv.Itoa(c.UpdateCheck.CadenceHours)+"h", "edit hours", false)
+	row(11, "notifications", checkbox(c.Notify), "toggle", true)
+	row(12, "theme", c.Theme, "cycle default/claude", false)
+
+	fmt.Printf("%s└────┴────────────────────────────┴────────────────────────────┴────────────────────────────────────┘%s\r\n\r\n", g, r)
+}
+
+func setAndSaveConfig(key, value string) error {
+	c, err := config.Load()
+	if err != nil {
+		return err
+	}
+	c, err = config.Set(c, key, value)
+	if err != nil {
+		return err
+	}
+	return config.Save(c)
+}
+
+// ANSI colors (themed)
+var (
+	ansiEnabled = true
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorTeal   = "\033[36m"
+	colorGray   = "\033[90m"
+	colorYellow = "\033[33m"
+	colorGreen  = "\033[32m"
+)
+
+func initTerminalOutput() {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		disableANSI()
+		return
+	}
+	if runtime.GOOS == "windows" {
+		enableUnicodeOutput()
+		if !enableANSIOutput() {
+			disableANSI()
+		}
+	}
+}
+
+func disableANSI() {
+	ansiEnabled = false
+	colorReset = ""
+	colorBold = ""
+	colorTeal = ""
+	colorGray = ""
+	colorYellow = ""
+	colorGreen = ""
+}
+
+// UI layout geometry: visual character widths for the status/list view.
+// The box border width (boxBorder) equals the sum of all column widths
+// plus the inner dividers, so the status header box and the account table
+// share exactly the same outer visual width (104 chars).
+const (
+	colSlotW  = 6   // SLOT column cell width
+	colEmailW = 30  // ACCOUNT column cell width
+	colStateW = 8   // STATE column cell width
+	colBarW   = 22  // usage bar column cell width (1 + 15 blocks + " %3d%%" + 1)
+	colResetW = 8   // RESET column cell width
+	barBlocks = 15  // number of █/░ segments in a usage bar
+	boxBorder = 101 // ─ count in the status box (= table inner width)
+	boxInner  = 99  // content chars between the status box margin spaces
+)
+
+func setTheme(name string) {
+	if !ansiEnabled {
+		disableANSI()
+		return
+	}
+
+	// Standard ANSI defaults
+	colorReset = "\033[0m"
+	colorBold = "\033[1m"
+	colorTeal = "\033[36m"
+	colorGray = "\033[90m"
+	colorYellow = "\033[33m"
+	colorGreen = "\033[32m"
+
+	if name == "claude" {
+		// Claude Brand Colors (Truecolor RGB)
+		// Primary Orange: #C15F3C
+		// Accent Orange: #FFB38A
+		// Cloudy Neutral: #B1ADA1
+		colorBold = "\033[1;38;2;193;95;60m"   // Bold Claude Orange
+		colorTeal = "\033[38;2;255;179;138m"   // Light Orange Accent
+		colorGray = "\033[38;2;177;173;161m"   // Cloudy Neutral
+		colorYellow = "\033[38;2;255;179;138m" // Use accent for prompts too
+		colorGreen = "\033[38;2;193;95;60m"    // Use primary for success/enabled
+	}
+}
+
+func promptValue(raw *rawMenu, reader *bufio.Reader, label, current string) (string, bool, error) {
+	fmt.Printf("%s%s%s\r\n", colorBold, label, colorReset)
+	fmt.Printf("%sCurrent:%s %s%s%s\r\n", colorGray, colorReset, colorTeal, displayEmpty(current), colorReset)
+	fmt.Printf("%sNew value:%s ", colorYellow, colorReset)
+	val, ok, err := readRawInput(raw, reader)
+	if err != nil || !ok {
+		return "", false, err
+	}
+	if val == "" || strings.EqualFold(val, "cancel") {
+		return "", false, nil
+	}
+	return val, true, nil
+}
+
+func normalizeEditorChoice(choice string) string {
+	choice = strings.TrimSpace(choice)
+	if choice == "\x1b" {
+		return "q"
+	}
+	choice = strings.ToLower(choice)
+	if n, err := strconv.Atoi(choice); err == nil {
+		return strconv.Itoa(n)
+	}
+	return choice
+}
+
+type rawMenu struct {
+	enabled bool
+	state   *term.State
+}
+
+func newRawMenu() (*rawMenu, error) {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return &rawMenu{}, nil
+	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return nil, err
+	}
+	return &rawMenu{enabled: true, state: state}, nil
+}
+
+func (r *rawMenu) Close() {
+	r.Suspend()
+}
+
+func (r *rawMenu) Suspend() {
+	if r == nil || !r.enabled || r.state == nil {
+		return
+	}
+	_ = term.Restore(int(os.Stdin.Fd()), r.state)
+}
+
+func (r *rawMenu) Resume() {
+	if r == nil || !r.enabled {
+		return
+	}
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err == nil {
+		r.state = state
+	}
+}
+
+func readEditorChoice(raw *rawMenu, reader *bufio.Reader) (string, error) {
+	val, ok, err := readRawInput(raw, reader)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "q", nil
+	}
+	return val, nil
+}
+
+func readRawInput(raw *rawMenu, reader *bufio.Reader) (string, bool, error) {
+	if raw == nil || !raw.enabled {
+		choice, err := reader.ReadString('\n')
+		if err != nil && len(choice) == 0 {
+			if errors.Is(err, io.EOF) {
+				fmt.Print("\r\n")
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		return strings.TrimSpace(choice), true, nil
+	}
+	var buf []byte
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Print("\r\n")
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		switch b {
+		case 0x03, 0x04: // Ctrl-C, Ctrl-D
+			fmt.Print("\r\n")
+			return "", false, nil
+		case 0x1b: // Esc
+			// Check if there are more bytes in the buffer (escape sequence like arrows)
+			if reader.Buffered() > 0 {
+				peek, _ := reader.Peek(1)
+				if peek[0] == '[' {
+					// It's an escape sequence (e.g. arrow keys ^[[A).
+					// Read until a terminator (usually a letter or ~).
+					_, _ = reader.ReadByte() // consume '['
+					for {
+						next, err := reader.ReadByte()
+						if err != nil || (next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') || next == '~' {
+							break
+						}
+					}
+					continue // Ignore the sequence
+				}
+			}
+			// Just a single Esc key
+			fmt.Print("\r\n")
+			return "", false, nil
+		case '\r', '\n':
+			fmt.Print("\r\n")
+			return string(buf), true, nil
+		case 0x7f, 0x08:
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				fmt.Print("\b \b")
+			}
+		default:
+			if b >= 32 && b < 127 {
+				buf = append(buf, b)
+				fmt.Printf("%c", b)
+			}
+		}
+	}
+}
+
+func waitEnter(reader *bufio.Reader) {
+	fmt.Print("Press Enter to continue...")
+	_, _ = reader.ReadString('\n')
+}
+
+func checkbox(v bool) string {
+	if v {
+		return "[" + colorGreen + "x" + colorReset + "] enabled "
+	}
+	return "[" + colorGray + " " + colorReset + "] disabled"
+}
+
+func displayEmpty(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return s[:n]
+	}
+	return s[:n-1] + "…"
+}
+
+func cmdUsage(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool usage refresh | anthropool usage show")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "refresh":
+		_, errs := monitor.RefreshAll()
+		for _, e := range errs {
+			fmt.Fprintln(os.Stderr, "warning:", e)
+		}
+		// Re-display so the user sees what was fetched.
+		cmdList(nil)
+	case "show":
+		cache, err := usage.LoadCache()
+		if err != nil {
+			fail(err)
+		}
+		out, err := json.MarshalIndent(cache, "", "  ")
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(string(out))
+	default:
+		fmt.Fprintln(os.Stderr, "usage: anthropool usage refresh | anthropool usage show")
+		os.Exit(2)
+	}
+}
+
+// --- Wrapper -------------------------------------------------------------
+
+func runWrapper(argv []string) {
+	updateDone := startUpdateCheck()
+	printCachedUpdateNotice()
+	warnIfSetupMissing()
+	bin := os.Getenv("ANTHROPOOL_CLAUDE_BIN")
+	if bin == "" {
+		resolved, err := exec.LookPath("claude")
+		if err != nil {
+			fail(fmt.Errorf("`claude` not found on PATH — install Claude Code first, or set ANTHROPOOL_CLAUDE_BIN"))
+		}
+		bin = resolved
+	}
+	if bin == os.Args[0] || strings.HasSuffix(bin, "/anthropool") {
+		fail(fmt.Errorf("refusing to launch anthropool as the claude binary (loop)"))
+	}
+	exitCode, err := wrapper.Run(bin, argv, os.Stderr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "anthropool:", err)
+	}
+	printUpdateResult(updateDone)
+	os.Exit(exitCode)
+}
+
+func warnIfSetupMissing() {
+	installed, err := setupInstalled()
+	if err != nil || installed {
+		return
+	}
+	fmt.Fprintln(os.Stderr, "anthropool: setup is not complete.")
+	fmt.Fprintln(os.Stderr, "     Run `anthropool setup` once to install /switch, /anthropool:* and Claude Code hooks.")
+}
+
+func setupInstalled() (bool, error) {
+	hooksInstalled, err := hookinstall.Installed()
+	if err != nil || !hooksInstalled {
+		return hooksInstalled, err
+	}
+	for _, p := range setupSlashCommandPaths() {
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				return false, nil
+			}
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func setupSlashCommandPaths() []string {
+	dir := filepath.Join(paths.ClaudeDir(), "commands")
+	anthropoolDir := filepath.Join(dir, "anthropool")
+	return []string{
+		filepath.Join(dir, "switch.md"),
+		filepath.Join(anthropoolDir, "add.md"),
+		filepath.Join(anthropoolDir, "config.md"),
+		filepath.Join(anthropoolDir, "list.md"),
+		filepath.Join(anthropoolDir, "remove.md"),
+		filepath.Join(anthropoolDir, "status.md"),
+		filepath.Join(anthropoolDir, "switch.md"),
+		filepath.Join(anthropoolDir, "usage-refresh.md"),
+	}
+}
+
+func startUpdateCheck() <-chan updater.Result {
+	cfg, err := config.Load()
+	if err != nil || !cfg.UpdateCheck.Enabled {
+		return nil
+	}
+	cadenceHours := cfg.UpdateCheck.CadenceHours
+	if cadenceHours < 1 {
+		cadenceHours = 6
+	}
+	done := make(chan updater.Result, 1)
+	go func() {
+		r, fresh, err := updater.CachedCheck(version, time.Duration(cadenceHours)*time.Hour)
+		if err == nil && fresh && r.HasUpdate() {
+			done <- r
+		}
+		close(done)
+	}()
+	return done
+}
+
+func printCachedUpdateNotice() {
+	cfg, err := config.Load()
+	if err != nil || !cfg.UpdateCheck.Enabled {
+		return
+	}
+	if r, ok := updater.CachedResult(version); ok && r.HasUpdate() {
+		fmt.Fprintf(os.Stderr, "anthropool: %s available — run anthropool upgrade.\n", r.Latest)
+	}
+}
+
+func printUpdateResult(done <-chan updater.Result) {
+	if done == nil {
+		return
+	}
+	select {
+	case r, ok := <-done:
+		if ok && r.HasUpdate() {
+			fmt.Fprintf(os.Stderr, "anthropool: %s available — run anthropool upgrade.\n", r.Latest)
+		}
+	default:
+	}
+}
+
+// cmdSetup is the one-time post-install ritual. It installs the
+// /switch and /anthropool:* slash commands plus the Claude Code hooks. Both
+// pieces are needed for the inline-switch flow to work.
+func cmdSetup(args []string) {
+	branding.Print(os.Stdout)
+	if err := installSlashCommand(); err != nil {
+		fail(err)
+	}
+	fmt.Println("✓ Installed /switch and /anthropool:* slash commands under ~/.claude/commands")
+
+	if resolved, err := hookinstall.VerifyOnPATH(); err != nil {
+		fmt.Fprintln(os.Stderr, "  warning:", err)
+		fmt.Fprintln(os.Stderr, "          hooks will be inert until `anthropool` is on PATH.")
+	} else {
+		fmt.Println("✓ anthropool is on PATH:", resolved)
+	}
+	changed, err := hookinstall.Install()
+	if err != nil {
+		fail(err)
+	}
+	if len(changed) == 0 {
+		fmt.Println("✓ Hooks already installed in ~/.claude/settings.json")
+	} else {
+		fmt.Printf("✓ Installed hooks: %s\n", strings.Join(changed, ", "))
+	}
+	if err := offerUpdateCheckOptIn(); err != nil {
+		fail(err)
+	}
+	if err := offerConfigSetup(); err != nil {
+		fail(err)
+	}
+	fmt.Println()
+	fmt.Println("Next steps:")
+	fmt.Println("  1. Run `anthropool add` or `/anthropool:add` while logged in to each account you want to manage.")
+	fmt.Println("  2. Restart Claude Code (or start a new session) so it picks up the hooks.")
+	fmt.Println("  3. Launch sessions with `anthropool` instead of `claude`, then use /switch and /anthropool:* inside.")
+}
+
+// offerConfigSetup shows the current config summary and offers to open
+// the interactive editor so users can tune settings during first-run setup.
+func offerConfigSetup() error {
+	if !stdinIsTTY() {
+		return nil
+	}
+	c, err := config.Load()
+	if err != nil {
+		return err
+	}
+	setTheme(c.Theme)
+	fmt.Println()
+	printSetupConfigSummary(c)
+	fmt.Print("Customize these settings now? [y/N] ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "y" || answer == "yes" {
+		return editConfigInteractive()
+	}
+	return nil
+}
+
+// printSetupConfigSummary renders a compact table of the most important
+// settings so the user knows what's active without opening the full editor.
+func printSetupConfigSummary(c config.Config) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	width := 54 // inner content width between the border spaces
+
+	hline := func(l, m, mid, rr string) {
+		fmt.Printf(" %s%s%s%s%s%s%s\n", g, l, strings.Repeat(m, 18), mid, strings.Repeat(m, width-18), rr, r)
+	}
+
+	row := func(label, value string) {
+		lpad := 18 - len(label) - 1
+		if lpad < 0 {
+			lpad = 0
+		}
+		vpad := width - 18 - len([]rune(stripANSI(value))) - 1
+		if vpad < 0 {
+			vpad = 0
+		}
+		fmt.Printf(" %s│%s %s%-*s%s %s│%s %s%s%s%s %s│%s\n",
+			g, r,
+			t, lpad, label, r,
+			g, r,
+			b, value, r,
+			strings.Repeat(" ", vpad),
+			g, r,
+		)
+	}
+
+	boolVal := func(v bool, onLabel, offLabel string) string {
+		if v {
+			return "[" + colorGreen + "x" + colorReset + "] " + colorGreen + onLabel + colorReset
+		}
+		return "[" + colorGray + " " + colorReset + "] " + colorGray + offLabel + colorReset
+	}
+
+	fmt.Printf(" %s%s:: C O N F I G   P R E V I E W ::%s\n\n", g, b, r)
+	hline("┌", "─", "┬", "┐")
+	fmt.Printf(" %s│%s %-16s %s│%s %-*s %s│%s\n",
+		g, r,
+		b+"SETTING"+r,
+		g, r,
+		width-18, b+"VALUE"+r,
+		g, r,
+	)
+	hline("├", "─", "┼", "┤")
+	row("theme", c.Theme)
+	row("strategy", c.Strategy.Kind)
+	row("5h threshold", strconv.Itoa(c.Thresholds.FiveHour)+"%")
+	row("7d threshold", strconv.Itoa(c.Thresholds.SevenDay)+"%")
+	row("threshold switch", boolVal(c.AutoSwitchOnThreshold, "on", "off"))
+	row("rate-limit switch", boolVal(c.AutoSwitchOnRateLimit, "on", "off"))
+	row("auto resume", boolVal(c.AutoResume, "on", "off"))
+	row("resume message", clip(displayEmpty(c.AutoMessage), width-20))
+	row("update checks", boolVal(c.UpdateCheck.Enabled, "on", "off"))
+	hline("└", "─", "┴", "┘")
+	fmt.Println()
+}
+
+// stripANSI removes ANSI escape sequences so we can measure visual width.
+func stripANSI(s string) string {
+	var out []byte
+	inEsc := false
+	for i := 0; i < len(s); i++ {
+		if inEsc {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if s[i] == '\x1b' {
+			inEsc = true
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
+}
+
+func offerUpdateCheckOptIn() error {
+	if !stdinIsTTY() {
+		return nil
+	}
+	fmt.Println()
+	fmt.Print("Check for anthropool updates daily on startup? [y/N] ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	cfg.UpdateCheck.Enabled = answer == "y" || answer == "yes"
+	if cfg.UpdateCheck.CadenceHours < 1 {
+		cfg.UpdateCheck.CadenceHours = 6
+	}
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	if cfg.UpdateCheck.Enabled {
+		fmt.Println("✓ Daily update checks enabled")
+	} else {
+		fmt.Println("✓ Daily update checks disabled")
+	}
+	return nil
+}
+
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+func cmdUpgrade(args []string) {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool upgrade")
+		os.Exit(2)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fail(err)
+	}
+	kind, installDir := detectInstall(exe)
+	switch kind {
+	case "npm":
+		runUpgradeCommand("npm", "install", "-g", "@Dave-Nguyen-PM/anthropool@latest")
+	case "installer":
+		cmd := exec.Command("sh", "-c", "curl -fsSL https://raw.githubusercontent.com/Dave-Nguyen-PM/anthropool/main/scripts/install.sh | sh")
+		cmd.Env = append(os.Environ(), "ANTHROPOOL_INSTALL_DIR="+installDir)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Run(); err != nil {
+			fail(err)
+		}
+	default:
+		fmt.Println("anthropool: could not detect how this binary was installed.")
+		fmt.Println()
+		fmt.Println("If you installed with npm, run:")
+		fmt.Println("  npm install -g @Dave-Nguyen-PM/anthropool@latest")
+		fmt.Println()
+		fmt.Println("If you installed with the shell installer, run:")
+		fmt.Println("  curl -fsSL https://raw.githubusercontent.com/Dave-Nguyen-PM/anthropool/main/scripts/install.sh | sh")
+	}
+}
+
+func runUpgradeCommand(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		fail(err)
+	}
+}
+
+func detectInstall(exe string) (kind, installDir string) {
+	exe, _ = filepath.Abs(exe)
+	dir := filepath.Dir(exe)
+	if isNPMInstall(dir) {
+		return "npm", ""
+	}
+	if envDir := os.Getenv("ANTHROPOOL_INSTALL_DIR"); envDir != "" {
+		if sameDir(dir, envDir) {
+			return "installer", dir
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		localBin := filepath.Join(home, ".local", "bin")
+		if sameDir(dir, localBin) {
+			return "installer", dir
+		}
+	}
+	return "", ""
+}
+
+func isNPMInstall(binDir string) bool {
+	if filepath.Base(binDir) != "bin" {
+		return false
+	}
+	pkgPath := filepath.Join(filepath.Dir(binDir), "package.json")
+	b, err := os.ReadFile(pkgPath)
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Name string `json:"name"`
+	}
+	return json.Unmarshal(b, &pkg) == nil && pkg.Name == "@Dave-Nguyen-PM/anthropool"
+}
+
+func sameDir(a, b string) bool {
+	aa, errA := filepath.Abs(a)
+	bb, errB := filepath.Abs(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(aa, bb)
+	}
+	return aa == bb
+}
+
+// --- Helpers -------------------------------------------------------------
+
+func fail(err error) {
+	fmt.Fprintln(os.Stderr, "anthropool:", err)
+	os.Exit(1)
+}
+
+// padTo right-pads s to exactly n rune-columns, truncating with "…" if needed.
+func padTo(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) > n {
+		if n <= 1 {
+			return string(runes[:n])
+		}
+		return string(runes[:n-1]) + "…"
+	}
+	return s + strings.Repeat(" ", n-len(runes))
+}
+
+// renderColorBar returns a colorized usage bar of barW block-chars followed by
+// a right-aligned percentage. Visual width: barW+5 (e.g. barW=15 → 20 chars).
+func renderColorBar(pct float64, barW int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := int(pct / 100.0 * float64(barW))
+	return colorGreen + strings.Repeat("█", filled) +
+		colorGray + strings.Repeat("░", barW-filled) + colorReset +
+		colorTeal + fmt.Sprintf(" %3.0f%%", pct) + colorReset
+}
+
+// accountState returns the display label for one row in the account table.
+func accountState(email, liveEmail string, au usage.AccountUsage) string {
+	if au.TokenExpired {
+		return "EXPRD"
+	}
+	if email == liveEmail {
+		return "ACTIVE"
+	}
+	if au.FiveHour != nil && au.FiveHour.Utilization >= 100 {
+		return "FULL"
+	}
+	if au.FiveHour != nil {
+		return "READY"
+	}
+	return "IDLE"
+}
+
+// tableSep builds one horizontal separator line for the account table.
+// left/mid/right are the box-drawing corner/junction characters.
+func tableSep(left, mid, right string) string {
+	g, r := colorGray, colorReset
+	cols := []int{colSlotW, colEmailW, colStateW, colBarW, colBarW, colResetW}
+	var sb strings.Builder
+	sb.WriteString(" " + g + left)
+	for i, w := range cols {
+		sb.WriteString(strings.Repeat("─", w))
+		if i < len(cols)-1 {
+			sb.WriteString(mid)
+		}
+	}
+	sb.WriteString(right + r)
+	return sb.String()
+}
+
+// printFancyHeader prints the ASCII art banner and the system status box.
+func printFancyHeader(w io.Writer, st *store.State, liveEmail string) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	fmt.Fprintf(w, "\n%s%s%s\n", t, branding.Banner, r)
+	fmt.Fprintf(w, " %s:: A C C O U N T   P O O L ::%s\n\n", b, r)
+
+	statusLabel := "NONE"
+	slotStr := "--"
+	if liveEmail != "" {
+		statusLabel = "ACTIVE"
+		if st.ActiveSlot != 0 {
+			slotStr = fmt.Sprintf("%02d", st.ActiveSlot)
+		}
+	}
+	managedStr := fmt.Sprintf("%02d", len(st.Accounts))
+
+	liveDisp := liveEmail
+	if liveDisp == "" {
+		liveDisp = "(none — run `claude login`)"
+	}
+
+	// Compute visible widths for correct padding (all fields are ASCII except
+	// liveDisp, which may contain an em-dash in the fallback string).
+	l1Left := len("  SYSTEM STATUS : ") + len(statusLabel) + len(" [") + len(slotStr) + len("]")
+	l1Right := len("MANAGED ACCOUNTS : ") + len(managedStr) + len("  ")
+	l1Pad := boxInner - l1Left - l1Right
+	if l1Pad < 1 {
+		l1Pad = 1
+	}
+
+	l2Prefix := "  LIVE INSTANCE : "
+	liveRunes := []rune(liveDisp)
+	l2Pad := boxInner - len(l2Prefix) - len(liveRunes)
+	if l2Pad < 0 {
+		max := boxInner - len(l2Prefix) - 1
+		if max > 0 {
+			liveDisp = string(liveRunes[:max]) + "…"
+		}
+		l2Pad = 0
+	}
+
+	statusColor := t
+	if statusLabel == "ACTIVE" {
+		statusColor = colorGreen
+	}
+
+	line1 := g + "  SYSTEM STATUS : " + r +
+		statusColor + statusLabel + r +
+		g + " [" + slotStr + "]" + r +
+		strings.Repeat(" ", l1Pad) +
+		g + "MANAGED ACCOUNTS : " + r +
+		b + managedStr + r + "  "
+
+	line2 := g + l2Prefix + r +
+		t + liveDisp + r +
+		strings.Repeat(" ", l2Pad)
+
+	fmt.Fprintf(w, " %s┌%s┐%s\n", g, strings.Repeat("─", boxBorder), r)
+	fmt.Fprintf(w, " %s│%s %s %s│%s\n", g, r, line1, g, r)
+	fmt.Fprintf(w, " %s│%s %s %s│%s\n", g, r, line2, g, r)
+	fmt.Fprintf(w, " %s└%s┘%s\n\n", g, strings.Repeat("─", boxBorder), r)
+}
+
+// printAccountTable renders the full account usage table below the status box.
+func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usage.Cache) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	hCell := func(text string, cellW int) string {
+		return " " + b + padTo(text, cellW-2) + r + " "
+	}
+
+	fmt.Fprintln(w, tableSep("┌", "┬", "┐"))
+	fmt.Fprintf(w, " %s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s\n",
+		g, r, hCell("SLOT", colSlotW),
+		g, r, hCell("ACCOUNT", colEmailW),
+		g, r, hCell("STATE", colStateW),
+		g, r, hCell("5H USAGE", colBarW),
+		g, r, hCell("7D USAGE", colBarW),
+		g, r, hCell("RESET", colResetW),
+		g, r)
+	fmt.Fprintln(w, tableSep("├", "┼", "┤"))
+
+	slots := st.SortedSlots()
+	sort.Ints(slots)
+
+	noBar := strings.Repeat(" ", 10) + g + "─" + r + strings.Repeat(" ", 11)
+
+	for _, slot := range slots {
+		a := st.Accounts[slot]
+		au := cache[a.CacheKey()]
+		sl := accountState(a.Email, liveEmail, au)
+
+		var sc string
+		switch sl {
+		case "ACTIVE":
+			sc = colorGreen
+		case "FULL", "EXPRD":
+			sc = colorYellow
+		default:
+			sc = t
+		}
+
+		resetStr := nextReset(au)
+
+		var barFive, barSeven string
+		if au.FiveHour != nil {
+			barFive = " " + renderColorBar(au.FiveHour.Utilization, barBlocks) + " "
+		} else {
+			barFive = noBar
+		}
+		if au.SevenDay != nil {
+			barSeven = " " + renderColorBar(au.SevenDay.Utilization, barBlocks) + " "
+		} else {
+			barSeven = noBar
+		}
+
+		slotCell := "  " + b + fmt.Sprintf("%02d", slot) + r + "  "
+		emailCell := " " + t + padTo(a.Email, colEmailW-2) + r + " "
+		stateCell := " " + sc + padTo(sl, colStateW-2) + r + " "
+		resetCell := " " + t + padTo(resetStr, colResetW-2) + r + " "
+
+		fmt.Fprintf(w, " %s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s\n",
+			g, r, slotCell,
+			g, r, emailCell,
+			g, r, stateCell,
+			g, r, barFive,
+			g, r, barSeven,
+			g, r, resetCell,
+			g, r)
+	}
+
+	fmt.Fprintln(w, tableSep("└", "┴", "┘"))
+}
+
+func renderSupport(useANSI bool) string {
+	var b strings.Builder
+	b.WriteString(":: A N T H R O P O O L   S U P P O R T ::\n\n")
+	b.WriteString("Support anthropool development:\n")
+	b.WriteString(donateURL)
+	b.WriteString("\n")
+	return b.String()
+}
+
+func printHelp() {
+	fmt.Println(`anthropool — Run multiple Claude Code Pro/Max accounts as one
+
+USAGE
+  anthropool [claude-args...]              run claude under the wrapper (default)
+  anthropool run [claude-args...]          same, explicit
+  anthropool add [--slot N]                add the currently logged-in account
+  anthropool list                          list managed accounts
+  anthropool switch <slot|email>           swap the active account (manual; requires
+                                    restart unless run from /switch inside)
+  anthropool force-switch [slot|email]     emergency swap for an active anthropool session
+                                    when Claude will not run /switch
+  anthropool remove [--force] <slot|email> remove an account from anthropool
+  anthropool status                        show live login + anthropool state
+  anthropool support                       show support URL
+  anthropool docs                          show documentation URL
+  anthropool setup                         install /switch, /anthropool:* + Claude Code hooks
+  anthropool install-hooks                 install Claude Code hooks only
+  anthropool uninstall-hooks               remove anthropool's entries from settings.json
+  anthropool history [-n N] [--json]       show recent account swaps
+  anthropool history --clear               delete the swap history
+  anthropool config show                   print current configuration
+  anthropool config keys                   list every settable key
+  anthropool config edit                   interactive settings editor
+  anthropool config set <key> <value>      update a single setting
+  anthropool usage refresh                 fetch fresh usage for every account
+  anthropool usage show                    print the on-disk usage cache (JSON)
+  anthropool upgrade                       update anthropool using npm or the installer
+  anthropool hook <event>                  internal: invoked by Claude Code
+  anthropool version                       print version
+
+INLINE SWITCHING
+  Once set up, type /switch [<slot|email>] from inside a Claude Code
+  session started via anthropool. You can also use /anthropool:switch, /anthropool:add,
+  /anthropool:list, /anthropool:status, /anthropool:support, /anthropool:config, /anthropool:remove,
+  and /anthropool:usage-refresh from inside the
+  session. Manual and rate-limit swaps reconnect with --resume.`)
+}
