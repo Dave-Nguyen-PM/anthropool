@@ -140,8 +140,6 @@ conversation is intact — but if you see anything unexpected, please
 
 ## Quick start
 
-Website: https://anthropool.dave.com
-
 ```bash
 anthropool setup           # install /switch, /anthropool:* + Claude Code hooks
 anthropool add             # register the currently-logged-in account
