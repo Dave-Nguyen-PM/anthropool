@@ -56,7 +56,6 @@ anthropool: rate limit on alice@example.com → swapped to bob@example.com, resu
 - [Security](#security)
 - [Building from source](#building-from-source)
 - [License](#license)
-- [Socials](#socials)
 
 ## Install
 
@@ -326,14 +325,3 @@ Requires Go 1.21+.
 
 [GPL-3.0-only](./LICENSE). Modifying and redistributing `anthropool` is
 welcome; if you do, your changes need to ship under GPL-3.0 too.
-
-## Socials
-
-All dave social channels live at
-**[socials.dave.com](https://socials.dave.com)** — one place
-for updates, other projects, and how to reach me.
-
----
-
-If `anthropool` saves you time, you can support development at
-[support.dave.com](https://support.dave.com).
