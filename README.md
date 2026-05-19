@@ -16,26 +16,6 @@
     <img alt="latest release"
          src="https://img.shields.io/github/v/release/Dave-Nguyen-PM/anthropool?style=for-the-badge&label=Release&color=c8763a&labelColor=0e1116&logo=github&logoColor=f0ead6">
   </a>
-  &nbsp;
-  <a href="https://www.npmjs.com/package//anthropool">
-    <img alt="npm version"
-         src="https://img.shields.io/npm/v//anthropool?style=for-the-badge&label=npm&color=c8763a&labelColor=0e1116&logo=npm&logoColor=f0ead6">
-  </a>
-  &nbsp;
-  <a href="https://github.com/Dave-Nguyen-PM/anthropool/blob/main/LICENSE">
-    <img alt="license"
-         src="https://img.shields.io/badge/License-GPL--3.0-c8763a?style=for-the-badge&labelColor=0e1116&logo=gnu&logoColor=f0ead6">
-  </a>
-  &nbsp;
-  <a href="https://support.dave.com">
-    <img alt="support"
-         src="https://img.shields.io/badge/Support-%E2%99%A5-c8763a?style=for-the-badge&labelColor=0e1116&logo=githubsponsors&logoColor=f0ead6">
-  </a>
-  &nbsp;
-  <a href="https://anthropool.dave.com/docs">
-    <img alt="docs"
-         src="https://img.shields.io/badge/Docs-anthropool.dave.com-c8763a?style=for-the-badge&labelColor=0e1116&logo=readthedocs&logoColor=f0ead6">
-  </a>
 </p>
 
 ---
