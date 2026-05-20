@@ -40,9 +40,8 @@ anthropool: rate limit on alice@example.com → swapped to bob@example.com, resu
 
 - [Contents](#contents)
 - [Install](#install)
-  - [Option 1 — npm](#option-1--npm)
-  - [Option 2 — shell installer](#option-2--shell-installer)
-  - [Option 3 — manual binary](#option-3--manual-binary)
+  - [Option 1 — shell installer](#option-1--shell-installer)
+  - [Option 2 — manual binary](#option-2--manual-binary)
   - [After install](#after-install)
   - [What works on which platform](#what-works-on-which-platform)
 - [Quick start](#quick-start)
@@ -59,18 +58,10 @@ anthropool: rate limit on alice@example.com → swapped to bob@example.com, resu
 
 ## Install
 
-Three install methods. Pick the one that fits your platform — they
+Two install methods. Pick the one that fits your platform — they
 all install the same `anthropool` binary.
 
-### Option 1 — npm
-
-Works on Linux, macOS and Windows. Requires Node.js 18 or newer.
-
-```bash
-npm install -g /anthropool
-```
-
-### Option 2 — shell installer
+### Option 1 — shell installer
 
 Works on Linux, macOS, WSL and Git Bash on Windows.
 
@@ -78,7 +69,7 @@ Works on Linux, macOS, WSL and Git Bash on Windows.
 curl -fsSL https://raw.githubusercontent.com/Dave-Nguyen-PM/anthropool/main/scripts/install.sh | sh
 ```
 
-### Option 3 — manual binary
+### Option 2 — manual binary
 
 Works everywhere. Useful if you don't want Node.js and can't run
 shell scripts (e.g. native Windows PowerShell or cmd.exe).
@@ -107,7 +98,6 @@ afterwards so it picks them up.
 | Credential storage | file (0600) | Keychain | file (0600) | Credential Manager |
 | Hooks + `/switch` and `/anthropool:*` slash commands | ✅ | ✅ | ✅ | ✅ |
 | Auto-resume on swap | ✅ | ✅ | ✅ | ✅ † |
-| `npm install -g /anthropool` | ✅ | ✅ | ✅ | ✅ |
 | `curl … \| sh` shell installer | ✅ | ✅ | ✅ | ❌ |
 | Manual binary download | ✅ | ✅ | ✅ | ✅ |
 
