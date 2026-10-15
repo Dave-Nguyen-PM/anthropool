@@ -52,9 +52,9 @@ import (
 //	-ldflags "-X main.version=X.Y.Z"
 //
 // It must be a var (not const) so -ldflags can inject the real release
-// tag. The fallback "1.0.2" is the development/unreleased default;
+// tag. The fallback "1.0.3" is the development/unreleased default;
 // released binaries always get the tag stamped in.
-var version = "1.0.2"
+var version = "1.0.3"
 
 const (
 	// donateURL (the issue tracker) is shown only by `anthropool version --verbose`. Subtle by
