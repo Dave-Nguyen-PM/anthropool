@@ -25,11 +25,19 @@ import (
 )
 
 const (
-	defaultRepo    = "Dave-Nguyen-PM/anthropool"
-	envRepo        = "ANTHROPOOL_RELEASE_REPO"
+	defaultRepo   = "Dave-Nguyen-PM/anthropool"
+	envRepo       = "ANTHROPOOL_RELEASE_REPO"
+	cacheFileName = "update-cache.json"
+	httpTimeout   = 5 * time.Second
+)
+
+// URL templates are vars so tests can point them at an httptest server.
+var (
 	releasesAPIFmt = "https://api.github.com/repos/%s/releases/latest"
-	cacheFileName  = "update-cache.json"
-	httpTimeout    = 5 * time.Second
+	// releasesWebFmt is the browser URL GitHub redirects to the newest
+	// release's tag page. It is not subject to the REST API's 60/hour
+	// unauthenticated rate limit, so it serves as the fallback.
+	releasesWebFmt = "https://github.com/%s/releases/latest"
 )
 
 // Result describes a newer release. Empty Latest means "no update".
@@ -104,11 +112,27 @@ func CachedCheck(current string, cadence time.Duration) (Result, bool, error) {
 
 // fetchLatest makes the HTTP call. Exported only via CachedCheck so the
 // cache discipline can't be bypassed accidentally.
+//
+// The REST API is tried first. When it fails (most often a 403 from the
+// unauthenticated rate limit), the latest tag is read from the redirect
+// on the releases/latest web page instead.
 func fetchLatest(current string) (Result, error) {
 	repo := os.Getenv(envRepo)
 	if repo == "" {
 		repo = defaultRepo
 	}
+	r, apiErr := fetchLatestAPI(repo, current)
+	if apiErr == nil {
+		return r, nil
+	}
+	r, webErr := fetchLatestWeb(repo, current)
+	if webErr == nil {
+		return r, nil
+	}
+	return Result{}, fmt.Errorf("%w (fallback via releases page also failed: %v)", apiErr, webErr)
+}
+
+func fetchLatestAPI(repo, current string) (Result, error) {
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf(releasesAPIFmt, repo), nil)
 	if err != nil {
 		return Result{}, err
@@ -124,7 +148,7 @@ func fetchLatest(current string) (Result, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return Result{}, fmt.Errorf("updater: HTTP %d", resp.StatusCode)
+		return Result{}, apiStatusError(resp)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	if err != nil {
@@ -141,6 +165,65 @@ func fetchLatest(current string) (Result, error) {
 		Current: stripV(current),
 		Latest:  stripV(raw.TagName),
 		HTMLURL: raw.HTMLURL,
+		Polled:  time.Now().UTC(),
+	}, nil
+}
+
+// apiStatusError names the rate limit when that is what a non-200 means,
+// so the user sees why rather than a bare status code.
+func apiStatusError(resp *http.Response) error {
+	limited := resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusForbidden && resp.Header.Get("X-RateLimit-Remaining") == "0")
+	if !limited {
+		return fmt.Errorf("updater: GitHub API HTTP %d", resp.StatusCode)
+	}
+	msg := fmt.Sprintf("updater: GitHub API rate limit exceeded (HTTP %d)", resp.StatusCode)
+	if reset, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+		msg += ", resets at " + time.Unix(reset, 0).Local().Format("15:04")
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+// fetchLatestWeb resolves the latest tag from the Location header of the
+// releases/latest page, which redirects to .../releases/tag/<tag>.
+func fetchLatestWeb(repo, current string) (Result, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf(releasesWebFmt, repo), nil)
+	if err != nil {
+		return Result{}, err
+	}
+	req.Header.Set("User-Agent", "anthropool/"+stripV(current))
+
+	client := &http.Client{
+		Timeout: httpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Result{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return Result{}, fmt.Errorf("releases page HTTP %d, expected a redirect", resp.StatusCode)
+	}
+	loc, err := resp.Location()
+	if err != nil {
+		return Result{}, fmt.Errorf("releases page redirect: %w", err)
+	}
+	const marker = "/releases/tag/"
+	i := strings.LastIndex(loc.Path, marker)
+	if i < 0 {
+		return Result{}, fmt.Errorf("releases page redirected to %s, not a release tag", loc)
+	}
+	tag := strings.Trim(loc.Path[i+len(marker):], "/")
+	if tag == "" {
+		return Result{}, fmt.Errorf("releases page redirected to %s, not a release tag", loc)
+	}
+	return Result{
+		Current: stripV(current),
+		Latest:  stripV(tag),
+		HTMLURL: loc.String(),
 		Polled:  time.Now().UTC(),
 	}, nil
 }
