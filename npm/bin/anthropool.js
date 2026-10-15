@@ -16,7 +16,7 @@ const binPath = join(here, binName);
 if (!existsSync(binPath)) {
   console.error(
     `anthropool: binary not found at ${binPath}.\n` +
-    "Postinstall may have failed; try `npm install -g /anthropool --force`, " +
+    "Postinstall may have failed; try `npm install -g @Dave-Nguyen-PM/anthropool --force`, " +
     "or download the binary manually from " +
     "https://github.com/Dave-Nguyen-PM/anthropool/releases",
   );

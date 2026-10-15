@@ -32,7 +32,7 @@ See [Windows PATH fix](./installation.md#windows-path-fix) in the installation g
 
 ```
 anthropool: binary not found at C:\...\node_modules\@dave\anthropool\bin\anthropool.exe.
-Postinstall may have failed; try `npm install -g /anthropool --force`
+Postinstall may have failed; try `npm install -g @Dave-Nguyen-PM/anthropool --force`
 ```
 
 **Cause**
@@ -44,7 +44,7 @@ The npm postinstall script downloads the native binary from GitHub Releases. If 
 Re-run the install with `--force` to trigger the postinstall again:
 
 ```bash
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 If that still fails (e.g. corporate proxy, offline environment), download the binary manually from the [releases page](https://github.com/Dave-Nguyen-PM/anthropool/releases/latest) and place it at the path shown in the error message (rename it to `anthropool.exe` on Windows or `anthropool` on Linux/macOS).
@@ -128,7 +128,7 @@ anthropool   # instead of: claude
 Download the latest binary manually from the [releases page](https://github.com/Dave-Nguyen-PM/anthropool/releases/latest) and replace your existing binary, or re-install via npm:
 
 ```bash
-npm install -g /anthropool
+npm install -g @Dave-Nguyen-PM/anthropool
 ```
 
 ---

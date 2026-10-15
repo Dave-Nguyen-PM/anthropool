@@ -7,7 +7,10 @@ package switcher
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/claudecfg"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/creds"
@@ -23,7 +26,16 @@ const lockTimeout = 10 * time.Second
 // managed, its credential and oauth backups are refreshed in place
 // rather than rejected — this is the natural way to refresh a stale
 // token (`claude login` again, then `anthropool add`).
-func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err error) {
+//
+// alias is optional: pass "" to auto-derive from the account's displayName.
+// Pass skipAutoAlias=true to store the account with no alias at all.
+// When alias is non-empty it must pass store.ValidateAlias and be unique.
+//
+// force skips the identity/token cross-check (see slotSharingToken). The
+// check is a heuristic about tokens, and being wrong about it would block
+// the very command a user runs to repair a broken pool, so there is a way
+// past it — but taking it stores a pairing anthropool believes is inconsistent.
+func AddCurrent(preferredSlot int, alias string, skipAutoAlias, force bool) (added store.Account, refreshed bool, err error) {
 	if err := ensureBackupRoot(); err != nil {
 		return store.Account{}, false, err
 	}
@@ -43,6 +55,17 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		if errors.Is(err, creds.ErrNotFound) {
 			return store.Account{}, false, errors.New("no active Claude Code login found — run `claude login` first")
 		}
+		if errors.Is(err, creds.ErrNoAccountToken) {
+			// Credentials exist but hold no account token: the login is
+			// stored somewhere anthropool does not know about (issue #42). Capturing
+			// it anyway would build a slot that signs the user out later, so
+			// stop here and say what was actually found.
+			return store.Account{}, false, errors.New(
+				"Claude Code's stored credentials carry no account token, so there is nothing to capture — " +
+					"the login may be held by a credential provider anthropool does not recognise. " +
+					"Run `claude login`, then retry; if it persists, please report your Claude Code version at " +
+					"https://github.com/Dave-Nguyen-PM/anthropool/issues")
+		}
 		return store.Account{}, false, err
 	}
 
@@ -57,6 +80,32 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		return store.Account{}, false, err
 	}
 
+	// The identity above and the token below come from two different files
+	// that can disagree; capturing a mismatched pair is silent corruption,
+	// so refuse before anything is written. See slotSharingToken.
+	if !force {
+		if slot, other := slotSharingToken(state, state.FindByIdentity(parsed.EmailAddress, parsed.OrganizationUUID), liveCreds); slot != 0 {
+			return store.Account{}, false, fmt.Errorf(
+				"%w: Claude Code names %s, but the credentials it has stored carry the same account token already saved for slot %d (%s). "+
+					"Capturing this would file one account's token under the other's name, and both slots would then report identical usage — "+
+					"a threshold swap could move onto an exhausted account. "+
+					"Check CLAUDE_CONFIG_DIR points where you expect, run `claude login` as %s, then retry. "+
+					"Pass --force to capture the pair anyway",
+				ErrTokenIdentityMismatch, parsed.EmailAddress, slot, other, parsed.EmailAddress)
+		}
+	}
+
+	// Validate alias early so we fail before touching any files.
+	// When no alias is explicitly provided, auto-derive one from the
+	// account's displayName so users get friendly names without extra steps.
+	if alias != "" {
+		if err := store.ValidateAlias(alias); err != nil {
+			return store.Account{}, false, err
+		}
+	} else if !skipAutoAlias && parsed.DisplayName != "" {
+		alias = SuggestAlias(state, parsed.DisplayName, parsed.OrganizationName)
+	}
+
 	if existing := state.FindByIdentity(parsed.EmailAddress, parsed.OrganizationUUID); existing != 0 {
 		// Refresh: overwrite backups for this slot, no state shape change.
 		acct := state.Accounts[existing]
@@ -67,6 +116,13 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 			return store.Account{}, false, err
 		}
 		acct.LastUsed = time.Now().UTC()
+		// Update alias if provided (allows renaming on re-add).
+		if alias != "" {
+			if err := state.SetAlias(existing, alias); err != nil {
+				return store.Account{}, false, err
+			}
+			acct = state.Accounts[existing]
+		}
 		state.Accounts[existing] = acct
 		state.ActiveSlot = existing
 		if err := state.Save(); err != nil {
@@ -82,6 +138,12 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		return store.Account{}, false, fmt.Errorf("slot %d already in use", slot)
 	}
 
+	if alias != "" {
+		if existing := state.FindByAlias(alias); existing != 0 {
+			return store.Account{}, false, fmt.Errorf("store: alias %q is already used by slot %d (%s)", alias, existing, state.Accounts[existing].Email)
+		}
+	}
+
 	if err := creds.WriteBackup(slot, parsed.EmailAddress, liveCreds); err != nil {
 		return store.Account{}, false, err
 	}
@@ -95,11 +157,46 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		_ = store.DeleteOAuthBlockBackup(slot, parsed.EmailAddress)
 		return store.Account{}, false, err
 	}
+	if alias != "" {
+		if err := state.SetAlias(slot, alias); err != nil {
+			_ = creds.DeleteBackup(slot, parsed.EmailAddress)
+			_ = store.DeleteOAuthBlockBackup(slot, parsed.EmailAddress)
+			_ = state.Remove(slot)
+			return store.Account{}, false, err
+		}
+	}
 	state.ActiveSlot = slot
 	if err := state.Save(); err != nil {
 		return store.Account{}, false, err
 	}
 	return state.Accounts[slot], false, nil
+}
+
+// ErrTokenIdentityMismatch is returned by AddCurrent when the live
+// credentials carry an account token that is already stored under a
+// different managed slot — the fingerprint of Claude Code's identity file
+// and its credential store describing two different accounts.
+var ErrTokenIdentityMismatch = errors.New("switcher: stored credentials belong to a different account than Claude Code's identity file names")
+
+// slotSharingToken reports the managed slot, other than skipSlot, whose
+// stored credentials carry the same account token as blob. See
+// creds.SlotHoldingToken for why a shared token is the reliable tell; this
+// wrapper only adapts the state's slot map to it.
+//
+// skipSlot is the slot the caller is about to write, excluded because
+// re-running `anthropool add` for an account already managed is the normal way to
+// refresh its token and would otherwise match itself.
+func slotSharingToken(state *store.State, skipSlot int, blob string) (int, string) {
+	// Slot order, not map order, so the reported collision is deterministic
+	// when more than one slot has been corrupted.
+	slots := make([]creds.SlotRef, 0, len(state.Accounts))
+	for _, slot := range state.SortedSlots() {
+		slots = append(slots, creds.SlotRef{Slot: slot, Email: state.Accounts[slot].Email})
+	}
+	if ref, ok := creds.SlotHoldingToken(slots, skipSlot, blob); ok {
+		return ref.Slot, ref.Email
+	}
+	return 0, ""
 }
 
 // SwitchTo activates the target account: backs up the current account's
@@ -137,6 +234,18 @@ func SwitchTo(identifier string) (from, to store.Account, err error) {
 	if err != nil {
 		return store.Account{}, store.Account{}, fmt.Errorf("target credentials missing: %w", err)
 	}
+	// A slot captured while anthropool was reading the wrong keychain item holds a
+	// blob with no account token (issue #42). Writing it live would sign the
+	// user out, and creds.WriteLive now refuses to — but refusing at the
+	// bottom of the stack only produces a confusing message, so say what is
+	// wrong with the slot and how to repair it while we still know which one
+	// it is.
+	if _, tokErr := creds.ExtractAccessToken(targetCreds); tokErr != nil {
+		return store.Account{}, store.Account{}, fmt.Errorf(
+			"slot %d (%s) has no usable stored login: its saved credentials carry no account token, "+
+				"so switching to it would sign you out — run `claude login` as %s, then `anthropool add` to recapture the slot",
+			target.Slot, target.Email, target.Email)
+	}
 	targetOAuth, err := store.ReadOAuthBlockBackup(target.Slot, target.Email)
 	if err != nil {
 		return store.Account{}, store.Account{}, fmt.Errorf("target oauthAccount missing: %w", err)
@@ -151,11 +260,19 @@ func SwitchTo(identifier string) (from, to store.Account, err error) {
 	if liveErr == nil && cfgErr == nil {
 		if slot := state.FindByIdentity(currentParsed.EmailAddress, currentParsed.OrganizationUUID); slot != 0 {
 			current = state.Accounts[slot]
-			if err := creds.WriteBackup(slot, current.Email, currentLive); err != nil {
-				return store.Account{}, store.Account{}, fmt.Errorf("backing up current creds: %w", err)
-			}
-			if err := store.WriteOAuthBlockBackup(slot, current.Email, currentRaw); err != nil {
-				return store.Account{}, store.Account{}, fmt.Errorf("backing up current oauth: %w", err)
+			// This refresh trusts the same identity/token pairing AddCurrent
+			// now verifies, and a mismatched pair here would overwrite a
+			// good backup with another account's token (slotSharingToken).
+			// Skipping the refresh only forgoes a token rotation; clobbering
+			// the slot would corrupt it, so prefer the stale copy and let
+			// the switch proceed.
+			if bad, _ := slotSharingToken(state, slot, currentLive); bad == 0 {
+				if err := creds.WriteBackup(slot, current.Email, currentLive); err != nil {
+					return store.Account{}, store.Account{}, fmt.Errorf("backing up current creds: %w", err)
+				}
+				if err := store.WriteOAuthBlockBackup(slot, current.Email, currentRaw); err != nil {
+					return store.Account{}, store.Account{}, fmt.Errorf("backing up current oauth: %w", err)
+				}
 			}
 		}
 		// If the live account isn't managed, we silently proceed — we
@@ -238,14 +355,18 @@ func CurrentLiveEmail() (string, error) {
 }
 
 // CurrentLiveCacheKey returns the usage-cache key for the currently active
-// account. When the account has an organizationUuid that is used; otherwise
-// the email is returned for backward compatibility.
+// account, derived the same way store.Account.CacheKey does so live and
+// managed lookups always agree.
 func CurrentLiveCacheKey() (string, error) {
 	_, parsed, err := claudecfg.ReadOAuthBlock()
 	if err != nil {
 		return "", err
 	}
-	acct := store.Account{Email: parsed.EmailAddress, OrgUUID: parsed.OrganizationUUID}
+	acct := store.Account{
+		Email:   parsed.EmailAddress,
+		UUID:    parsed.AccountUUID,
+		OrgUUID: parsed.OrganizationUUID,
+	}
 	return acct.CacheKey(), nil
 }
 
@@ -260,4 +381,105 @@ func ensureBackupRoot() error {
 		return err
 	}
 	return nil
+}
+
+// --- alias suggestion -------------------------------------------------------
+
+// nonAlphanumRE matches anything that isn't a lowercase letter or digit.
+var nonAlphanumRE = regexp.MustCompile(`[^a-z0-9]+`)
+
+// slugify converts a human display name into a valid alias candidate:
+//   - lower-case
+//   - spaces become hyphens
+//   - non-alphanumeric characters (except hyphens) are removed
+//   - leading digits get an "a" prefix (alias must start with a letter)
+//   - truncated to 20 characters
+//
+// Returns "" when the result is empty (e.g. the name was all symbols).
+func slugify(name string) string {
+	// Normalise: fold to ASCII lower-case, map spaces to hyphens.
+	var sb strings.Builder
+	prevHyphen := false
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		if unicode.IsSpace(r) {
+			if !prevHyphen {
+				sb.WriteRune('-')
+				prevHyphen = true
+			}
+		} else if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+			sb.WriteRune(r)
+			prevHyphen = (r == '-')
+		}
+		// everything else is dropped
+	}
+	s := strings.Trim(sb.String(), "-")
+	// Collapse consecutive hyphens.
+	s = nonAlphanumRE.ReplaceAllLiteralString(s, "-")
+	// Aliases must start with a letter.
+	if len(s) > 0 && s[0] >= '0' && s[0] <= '9' {
+		s = "a" + s
+	}
+	// Truncate.
+	runes := []rune(s)
+	if len(runes) > 20 {
+		s = string(runes[:20])
+	}
+	s = strings.TrimRight(s, "-")
+	return s
+}
+
+// SuggestAlias returns a unique alias for an account being added, derived
+// from its displayName and (if needed for disambiguation) its
+// organizationName. The returned alias is always valid per store.ValidateAlias
+// and not already in use in state. Returns "" when no displayName is
+// available or a valid slug cannot be derived.
+//
+// Collision resolution order:
+//  1. slug(displayName)
+//  2. slug(displayName) + "-" + slug(orgName)   (if orgName yields a useful suffix)
+//  3. slug(displayName) + "-2", "-3", …
+func SuggestAlias(state *store.State, displayName, orgName string) string {
+	base := slugify(displayName)
+	if base == "" {
+		return ""
+	}
+	if store.ValidateAlias(base) != nil {
+		return ""
+	}
+
+	// Try bare slug first.
+	if state.FindByAlias(base) == 0 {
+		return base
+	}
+
+	// Try base + org suffix when the org name gives a truly distinct token.
+	// Skip when the org slug starts with the base (e.g. "Rishabh Anand" for
+	// a user named "Rishabh" — the org is just the person's own name and adds
+	// no disambiguation value).
+	orgSlug := slugify(orgName)
+	if orgSlug != "" && orgSlug != base && !strings.HasPrefix(orgSlug, base) {
+		candidate := base + "-" + orgSlug
+		if len([]rune(candidate)) > 20 {
+			candidate = string([]rune(candidate)[:20])
+			candidate = strings.TrimRight(candidate, "-")
+		}
+		if store.ValidateAlias(candidate) == nil && state.FindByAlias(candidate) == 0 {
+			return candidate
+		}
+	}
+
+	// Numeric suffix fallback.
+	for i := 2; i <= 99; i++ {
+		candidate := fmt.Sprintf("%s-%d", base, i)
+		if len([]rune(candidate)) > 20 {
+			// Trim base to make room for the suffix.
+			suffix := fmt.Sprintf("-%d", i)
+			trimmed := string([]rune(base)[:20-len([]rune(suffix))])
+			candidate = strings.TrimRight(trimmed, "-") + suffix
+		}
+		if store.ValidateAlias(candidate) == nil && state.FindByAlias(candidate) == 0 {
+			return candidate
+		}
+	}
+	return ""
 }

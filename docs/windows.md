@@ -72,7 +72,7 @@ If you use **Windows Terminal** with multiple profiles (cmd, PowerShell, Git Bas
 
 | | Native Windows (cmd / PowerShell) | WSL (Ubuntu, Debian, etc.) |
 |---|---|---|
-| Install via npm | `npm install -g /anthropool` | `npm install -g /anthropool` |
+| Install via npm | `npm install -g @Dave-Nguyen-PM/anthropool` | `npm install -g @Dave-Nguyen-PM/anthropool` |
 | Binary downloaded | `anthropool-windows-amd64.exe` | `anthropool-linux-amd64` or `anthropool-linux-arm64` |
 | PATH to fix | Windows `Path` (see above) | Linux `PATH` (see [Linux guide](./linux.md)) |
 | Credential storage | Windows Credential Manager | File (`~/.local/share/anthropool/`) |
@@ -101,20 +101,20 @@ If npm install succeeds but running `anthropool` prints:
 
 ```
 anthropool: binary not found at C:\...\anthropool.exe.
-Postinstall may have failed; try `npm install -g /anthropool --force`
+Postinstall may have failed; try `npm install -g @Dave-Nguyen-PM/anthropool --force`
 ```
 
 Re-trigger the postinstall:
 
 ```cmd
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 If you are behind a corporate proxy that blocks GitHub, set the proxy first:
 
 ```cmd
 set HTTPS_PROXY=http://proxy.corp.example.com:8080
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 Or download the binary manually from the releases page and drop it at the path shown in the error.

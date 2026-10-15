@@ -14,9 +14,8 @@
 //     and just resume silently)
 //   - notify: true                    (no-op in v0.2; reserved for v0.3
 //     when desktop notifications land)
-//   - poll_interval_seconds: 60       (no-op until the monitor lands;
-//     kept here so users can tune it
-//     ahead of v0.3)
+//   - poll_interval_seconds: 60       (how often a wrapper re-evaluates its
+//     seat against the shared usage cache; not the API poll rate)
 package config
 
 import (
@@ -59,16 +58,38 @@ type UpdateCheckConfig struct {
 // the right knobs when you want auto-swap off but `/switch` rotation
 // to keep working.
 type Config struct {
-	Thresholds            usage.Thresholds  `json:"thresholds"`
-	Strategy              StrategyConfig    `json:"strategy"`
-	AutoSwitchOnThreshold bool              `json:"auto_switch_on_threshold"`
-	AutoSwitchOnRateLimit bool              `json:"auto_switch_on_rate_limit"`
-	AutoResume            bool              `json:"auto_resume"`
-	AutoMessage           string            `json:"auto_message"`
-	Notify                bool              `json:"notify"`
-	PollIntervalSeconds   int               `json:"poll_interval_seconds"`
-	UpdateCheck           UpdateCheckConfig `json:"update_check"`
-	Theme                 string            `json:"theme"`
+	Thresholds            usage.Thresholds `json:"thresholds"`
+	Strategy              StrategyConfig   `json:"strategy"`
+	AutoSwitchOnThreshold bool             `json:"auto_switch_on_threshold"`
+	AutoSwitchOnRateLimit bool             `json:"auto_switch_on_rate_limit"`
+	AutoResume            bool             `json:"auto_resume"`
+	AutoMessage           string           `json:"auto_message"`
+	WaitForReset          bool             `json:"wait_for_reset"`
+	RetryOnAPIError       bool             `json:"retry_on_api_error"`
+	Notify                bool             `json:"notify"`
+	PollIntervalSeconds   int              `json:"poll_interval_seconds"`
+	// SupportNotice gates the occasional support line. On by default, and a
+	// real setting rather than something a user has to silence with
+	// 2>/dev/null — that channel also carries the resume line and every
+	// rate-limit warning, and teaching people to discard it would cost more
+	// than the notice is worth.
+	SupportNotice bool `json:"support_notice"`
+	// ModelFallback is the ordered list of models to fall back through when
+	// a rejection names a model window rather than the account. Empty — the
+	// default — keeps the pre-existing behaviour exactly: every rate limit,
+	// model-typed or not, rotates the account.
+	ModelFallback []string `json:"model_fallback"`
+	// AutoSwapIdleAfterSeconds migrates a session that is sitting at an
+	// empty prompt off an over-threshold account, instead of waiting for
+	// its owner to come back and type. 0 disables it. See #39.
+	AutoSwapIdleAfterSeconds int               `json:"auto_swap_idle_after_seconds"`
+	UpdateCheck              UpdateCheckConfig `json:"update_check"`
+	Theme                    string            `json:"theme"`
+	// Attach exposes each session on a local Unix socket so `anthropool attach`
+	// (and compatible tools) can mirror the terminal; AttachInput
+	// additionally lets attached clients type into the session.
+	Attach      bool `json:"attach"`
+	AttachInput bool `json:"attach_input"`
 }
 
 // ResolvedStrategy returns the parsed strategy.Kind.
@@ -87,10 +108,26 @@ func Defaults() Config {
 		AutoSwitchOnRateLimit: true,
 		AutoResume:            true,
 		AutoMessage:           "Go continue.",
+		WaitForReset:          true,
+		RetryOnAPIError:       true,
 		Notify:                true,
 		PollIntervalSeconds:   60,
-		UpdateCheck:           UpdateCheckConfig{Enabled: false, CadenceHours: 6},
-		Theme:                 "claude",
+		SupportNotice:         true,
+		ModelFallback:         []string{},
+		// 15 minutes: long enough that a user reading output or thinking
+		// between prompts is never treated as gone, short enough that a
+		// terminal left overnight moves off a capped seat during the quiet
+		// hours rather than on the prompt that starts real work (#39).
+		AutoSwapIdleAfterSeconds: 900,
+		UpdateCheck:              UpdateCheckConfig{Enabled: true, CadenceHours: 6},
+		Theme:                    "claude",
+		// Off by default: an always-on PTY proxy taxes every session
+		// (resize corruption/jitter, extra CPU on output — see #33). Most
+		// users never attach, so keep claude sitting directly on the real
+		// terminal (native 0.2.x rendering). Opt in with
+		// `anthropool config set attach true` to enable `anthropool attach`.
+		Attach:      false,
+		AttachInput: true,
 	}
 }
 
@@ -162,20 +199,15 @@ func Set(c Config, key, value string) (Config, error) {
 			return c, fmt.Errorf("config: strategy.kind must be drain|balanced|manual, got %q", value)
 		}
 	case "strategy.order":
-		v := strings.TrimSpace(value)
-		if v == "" || v == `""` {
-			c.Strategy.Order = []string{}
-		} else {
-			parts := strings.Split(v, ",")
-			out := make([]string, 0, len(parts))
-			for _, p := range parts {
-				p = strings.TrimSpace(p)
-				if p != "" {
-					out = append(out, p)
-				}
-			}
-			c.Strategy.Order = out
+		c.Strategy.Order = splitList(value)
+	case "support_notice":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
 		}
+		c.SupportNotice = b
+	case "model_fallback":
+		c.ModelFallback = splitList(value)
 	case "auto_switch_on_threshold":
 		b, err := parseBool(value)
 		if err != nil {
@@ -204,12 +236,36 @@ func Set(c Config, key, value string) (Config, error) {
 		} else {
 			c.AutoMessage = value
 		}
+	case "wait_for_reset":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.WaitForReset = b
+	case "retry_on_api_error":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.RetryOnAPIError = b
 	case "notify":
 		b, err := parseBool(value)
 		if err != nil {
 			return c, err
 		}
 		c.Notify = b
+	case "attach":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.Attach = b
+	case "attach_input":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.AttachInput = b
 	case "update_check.enabled":
 		b, err := parseBool(value)
 		if err != nil {
@@ -228,6 +284,12 @@ func Set(c Config, key, value string) (Config, error) {
 			return c, fmt.Errorf("config: poll_interval_seconds must be a non-negative integer, got %q", value)
 		}
 		c.PollIntervalSeconds = n
+	case "auto_swap_idle_after_seconds":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return c, fmt.Errorf("config: auto_swap_idle_after_seconds must be a non-negative integer, got %q", value)
+		}
+		c.AutoSwapIdleAfterSeconds = n
 	case "theme":
 		v := strings.ToLower(strings.TrimSpace(value))
 		switch v {
@@ -299,14 +361,39 @@ func Keys(c Config) []KeyInfo {
 			Current:     c.AutoMessage,
 		},
 		{
+			Key: "wait_for_reset", Default: "true",
+			Description: "when every account is exhausted and nobody is at the session, sleep until the earliest reset and resume",
+			Current:     strconv.FormatBool(c.WaitForReset),
+		},
+		{
+			Key: "retry_on_api_error", Default: "true",
+			Description: "relaunch and auto-continue after a non-rate-limit API failure (fibonacci backoff)",
+			Current:     strconv.FormatBool(c.RetryOnAPIError),
+		},
+		{
 			Key: "notify", Default: "true",
 			Description: "desktop notifications on swap (reserved for v0.3)",
 			Current:     strconv.FormatBool(c.Notify),
 		},
 		{
 			Key: "poll_interval_seconds", Default: "60",
-			Description: "background usage poll interval (reserved for v0.3)",
+			Description: "how often a quiet session re-checks its seat against the usage cache",
 			Current:     strconv.Itoa(c.PollIntervalSeconds),
+		},
+		{
+			Key: "support_notice", Default: "true",
+			Description: "show the support link occasionally (first after 7 days, then monthly)",
+			Current:     strconv.FormatBool(c.SupportNotice),
+		},
+		{
+			Key: "model_fallback", Default: "(empty)",
+			Description: "on a model-specific cap, try these models on the same seat before swapping account",
+			Current:     strings.Join(c.ModelFallback, ","),
+		},
+		{
+			Key: "auto_swap_idle_after_seconds", Default: "900",
+			Description: "migrate a session idle this long off an over-threshold account (0 = off)",
+			Current:     strconv.Itoa(c.AutoSwapIdleAfterSeconds),
 		},
 		{
 			Key: "update_check.enabled", Default: "false",
@@ -322,6 +409,16 @@ func Keys(c Config) []KeyInfo {
 			Key: "theme", Default: "default",
 			Description: "visual style: default | claude",
 			Current:     c.Theme,
+		},
+		{
+			Key: "attach", Default: "false",
+			Description: "run claude on a wrapper PTY so `anthropool attach` (and compatible tools) can mirror it (off = native rendering, no per-session overhead)",
+			Current:     strconv.FormatBool(c.Attach),
+		},
+		{
+			Key: "attach_input", Default: "true",
+			Description: "when attach is on, let attached clients type into the session (false = view-only)",
+			Current:     strconv.FormatBool(c.AttachInput),
 		},
 	}
 }
@@ -363,4 +460,23 @@ func parseBool(s string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("config: expected boolean, got %q", s)
+}
+
+// splitList parses a comma-separated setting into a trimmed, non-empty list.
+// An empty value (or a literal `""`, which is how a shell often delivers
+// "clear this") yields an empty list rather than a list holding one empty
+// string.
+func splitList(value string) []string {
+	v := strings.TrimSpace(value)
+	if v == "" || v == `""` {
+		return []string{}
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

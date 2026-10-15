@@ -1,13 +1,15 @@
 package wrapper
 
 // SlashSwitch implements `anthropool __slash-switch <target>`, the body the
-// /switch slash command shells out to.
+// /switch and /anthropool:switch slash commands shell out to.
 //
-// This writes a switch-requested signal — the wrapper's poll loop picks
-// it up, asks Claude to exit cleanly, then performs the swap and resumes
-// the session. The command runs locally, so it does not need another
-// model turn after the slash command has been accepted.
-
+// The swap happens in place: this process rewrites the live credential
+// blob and returns. Claude Code re-reads credentials on every API
+// request, so the very next message continues on the new account in the
+// same session — no kill, no `--resume`, no lost context. (The auto
+// threshold hook uses the same in-place mechanism.) Mid-turn rate-limit
+// recovery and `anthropool force-switch` still go through the wrapper's
+// kill+resume path, which reloads the transcript when a turn is broken.
 import (
 	"errors"
 	"fmt"
@@ -17,14 +19,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dave-Nguyen-PM/anthropool/internal/config"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/history"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/monitor"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/paths"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/signals"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/store"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/switcher"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/usage"
 )
 
 // SlashSwitch is invoked by the slash command's bash block. target may
-// be empty — that means "rotate per the configured strategy", which
-// the wrapper resolves once it sees the signal.
+// be empty — that means "rotate per the configured strategy".
 func SlashSwitch(target string, w io.Writer) error {
 	if os.Getenv(envWrapped) != "1" {
 		return errors.New("/switch requires anthropool as the entry point — start your session with `anthropool` instead of `claude`")
@@ -41,8 +47,10 @@ func SlashSwitch(target string, w io.Writer) error {
 
 	target = strings.TrimSpace(target)
 
-	// Validate now so the user gets immediate feedback rather than a
-	// silent failure 100ms later when the wrapper rejects the target.
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
 	state, err := store.Load()
 	if err != nil {
 		return err
@@ -50,24 +58,116 @@ func SlashSwitch(target string, w io.Writer) error {
 	if len(state.Accounts) < 2 {
 		return errors.New("need at least two managed accounts — run `anthropool add` after logging into another account")
 	}
-	if target != "" {
-		resolved, err := state.Resolve(target)
-		if err != nil {
-			return err
-		}
-		if resolved.Slot == state.ActiveSlot {
-			fmt.Fprintf(w, "anthropool: already on %s, nothing to do\n", resolved.Email)
-			return nil
-		}
-		fmt.Fprintf(w, "Switching to %s — reconnecting after this turn ends.\n", resolved.Email)
-	} else {
-		fmt.Fprintln(w, "Rotating to next account — reconnecting after this turn ends.")
+
+	// Resolve explicit target (slot/email/alias) or rotate per strategy.
+	resolved, err := resolveTarget(target, history.TriggerManual, &cfg, nil)
+	if err != nil {
+		return err
+	}
+	acct, err := state.Resolve(resolved)
+	if err != nil {
+		return err
+	}
+	if acct.Slot == state.ActiveSlot {
+		fmt.Fprintf(w, "anthropool: already on %s, nothing to do\n", acct.Email)
+		return nil
 	}
 
-	return signals.Write(wrapperPID, signals.SwitchRequested, signals.SwitchRequestedPayload{
-		Target:    target,
-		Timestamp: time.Now().UTC(),
+	// In-place swap: rewrite the live credential blob. Claude picks it up
+	// on its next API request, so the same session continues on the new
+	// account with no restart.
+	from, to, err := switcher.SwitchTo(resolved)
+	if err != nil {
+		return fmt.Errorf("switch failed: %w", err)
+	}
+
+	// Record the swap so `anthropool history` and `anthropool list` stay accurate.
+	cwd, _ := os.Getwd()
+	cache, _ := usage.LoadCache()
+	fromU := cache[from.CacheKey()]
+	toU := cache[to.CacheKey()]
+	_ = history.Append(history.Entry{
+		From:        from.Email,
+		To:          to.Email,
+		Trigger:     history.TriggerManual,
+		Reason:      "user requested via /switch",
+		CWD:         cwd,
+		FromUsage5h: utilizationOrZero(fromU.FiveHour),
+		FromUsage7d: utilizationOrZero(fromU.SevenDay),
+		ToUsage5h:   utilizationOrZero(toU.FiveHour),
+		ToUsage7d:   utilizationOrZero(toU.SevenDay),
 	})
+
+	// Honour the deliberate choice: skip the auto threshold check on the
+	// very next prompt so a `/switch` onto a busy account is not
+	// immediately undone by auto-switch. (setManualSwitchState alone does
+	// not gate the UserPromptSubmit hook — the replay flag does.)
+	setManualSwitchState(to.Email)
+	_ = os.WriteFile(paths.ReplayFlagFile(wrapperPID), []byte("1"), 0o600)
+
+	// Freshen both accounts' usage in the background for `anthropool list`.
+	go func(fromEmail, toEmail string) {
+		_ = monitor.RefreshActive(fromEmail)
+		_ = monitor.RefreshActive(toEmail)
+	}(from.Email, to.Email)
+
+	fmt.Fprint(w, renderSwitched(from, to, toU))
+	return nil
+}
+
+// renderSwitched is what the user reads instead of their prompt. Claude Code
+// prefixes a blocked prompt with "operation blocked by hook", so this has to
+// state plainly that the switch happened and that nothing was lost — the
+// prefix otherwise makes a success look like a failure.
+func renderSwitched(from, to store.Account, u usage.AccountUsage) string {
+	const width = 74
+	var b strings.Builder
+	line := func(label, value string) {
+		b.WriteString(fmt.Sprintf("│ %-9s %-*s │\n", label, width-10, clipTo(value, width-10)))
+	}
+	rule := strings.Repeat("─", width+2)
+
+	b.WriteString(":: A C C O U N T   S W I T C H E D ::\n\n")
+	b.WriteString("┌" + rule + "┐\n")
+	line("NOW LIVE", to.Email+slotSuffix(to))
+	line("PREVIOUS", from.Email+slotSuffix(from))
+	if head := headroom(u); head != "" {
+		line("HEADROOM", head)
+	}
+	line("SESSION", "kept — credentials swapped in place, nothing restarted")
+	b.WriteString("└" + rule + "┘\n")
+	return b.String()
+}
+
+func slotSuffix(a store.Account) string {
+	if a.Slot == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  [slot %02d]", a.Slot)
+}
+
+// headroom reports what is left on the seat just switched to, so the user can
+// see straight away whether the swap actually bought them anything.
+func headroom(u usage.AccountUsage) string {
+	parts := make([]string, 0, 2)
+	if u.FiveHour != nil {
+		parts = append(parts, fmt.Sprintf("5h %.0f%% used", u.FiveHour.Utilization))
+	}
+	if u.SevenDay != nil {
+		parts = append(parts, fmt.Sprintf("7d %.0f%% used", u.SevenDay.Utilization))
+	}
+	return strings.Join(parts, "   ")
+}
+
+func clipTo(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n <= 1 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
 }
 
 // ForceSwitch is the out-of-band version of SlashSwitch. It is meant
