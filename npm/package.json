@@ -11,11 +11,7 @@
     "switcher",
     "oauth"
   ],
-  "homepage": "https://anthropool.dave.com",
-  "funding": {
-    "type": "individual",
-    "url": "https://support.dave.com"
-  },
+  "homepage": "https://github.com/Dave-Nguyen-PM/anthropool",
   "bugs": {
     "url": "https://github.com/Dave-Nguyen-PM/anthropool/issues"
   },

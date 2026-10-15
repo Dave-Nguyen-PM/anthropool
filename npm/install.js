@@ -18,8 +18,8 @@ import { pipeline } from "node:stream/promises";
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
 const version = pkg.version;
-const docsURL = "https://anthropool.dave.com/docs";
-const supportURL = "https://support.dave.com";
+const docsURL = "https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs";
+const supportURL = "https://github.com/Dave-Nguyen-PM/anthropool/issues";
 
 // Banner. Mirrors internal/branding/branding.go and scripts/install.sh.
 // Suppressed by:
@@ -161,7 +161,7 @@ function printNextSteps() {
   console.error("  3. Start Claude with `anthropool` instead of `claude`.");
   console.error("");
   console.error(`Docs: ${docsURL}`);
-  console.error(`Support development: ${supportURL}`);
+  console.error(`Help & bug reports: ${supportURL}`);
   npmGlobalBinHint();
 }
 
