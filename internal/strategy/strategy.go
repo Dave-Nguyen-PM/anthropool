@@ -26,7 +26,9 @@ package strategy
 
 import (
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/usage"
 )
@@ -72,6 +74,7 @@ func ParseKind(s string) Kind {
 // converts its store.Account list into Candidates before calling.
 type Candidate struct {
 	Email    string
+	Slot     int    // stable seat identifier; 0 when unknown (e.g. the live account)
 	CacheKey string // usage-cache key; falls back to Email when empty
 }
 
@@ -85,11 +88,34 @@ func (c Candidate) cacheKey() string {
 	return c.Email
 }
 
+// sameSeat reports whether two candidates are the same seat. Emails are
+// not unique — the same address can hold a personal subscription and
+// one seat per organization — so compare by cache key (one per seat)
+// whenever both sides carry one, and only fall back to email for
+// legacy candidates that predate seat keys.
+func sameSeat(a, b Candidate) bool {
+	if a.CacheKey != "" && b.CacheKey != "" {
+		return a.CacheKey == b.CacheKey
+	}
+	return a.Email == b.Email
+}
+
 // Pick is the strategy's answer. Reason is a short human-readable
 // label included in the swap-history log.
 type Pick struct {
 	Email  string
+	Slot   int // seat identifier; 0 when the pick predates slot tracking
 	Reason string
+}
+
+// Identifier returns the string to hand to switcher.SwitchTo. Slots are
+// unambiguous (emails are not, see sameSeat), so prefer the slot number
+// whenever the pick carries one.
+func (p Pick) Identifier() string {
+	if p.Slot > 0 {
+		return strconv.Itoa(p.Slot)
+	}
+	return p.Email
 }
 
 // PickNext chooses an account to swap to.
@@ -110,7 +136,20 @@ func PickNext(
 	current Candidate,
 	cache usage.Cache,
 	thresholds usage.Thresholds,
+	now time.Time,
 ) (Pick, bool) {
+	// Every reading below is a claim about the present, so windows that have
+	// already rolled over are cleared before anything reads them. Doing it
+	// once here keeps the helpers underneath free of clock handling.
+	//
+	// Staleness deliberately does *not* disqualify a candidate here. PickNext
+	// answers "where do we go" for a move that has already been decided —
+	// most sharply on the reactive path, where the API has just refused the
+	// current seat. Refusing to name a target because its reading is old
+	// would strand a live session, which is the failure #37 and #39 were
+	// about; landing somewhere unexpected only costs another swap. The
+	// existing treatment of a missing entry as available is the same call.
+	cache = settledCache(cache, now)
 	switch kind {
 	case KindManual:
 		return Pick{}, false
@@ -135,10 +174,17 @@ func ShouldRebalance(
 	current Candidate,
 	cache usage.Cache,
 	thresholds usage.Thresholds,
+	now time.Time,
 ) (Pick, bool) {
 	if kind != KindDrain {
 		return Pick{}, false
 	}
+	// Unlike PickNext, this hop is anthropool's own initiative: nothing is wrong
+	// with where the session is, and the whole claim is that some other
+	// account has recovered. A reading too old to support that claim must
+	// not produce a swap and a process restart (issue #39) — so here, and
+	// only here, stale disqualifies a candidate.
+	cache = settledCache(cache, now)
 
 	var priority *Candidate
 	if len(order) > 0 {
@@ -151,10 +197,20 @@ func ShouldRebalance(
 			if !isAvailable(cache, c.cacheKey()) {
 				continue
 			}
+			if staleReading(cache, c.cacheKey(), now) {
+				continue
+			}
 			if u, ok := cache[c.cacheKey()]; ok {
 				if over, _ := usage.IsOverThreshold(u, thresholds); over {
 					continue
 				}
+			}
+			// Never rebalance ONTO a model-capped account: the hop is
+			// proactive, and landing a heavy-Opus session on a capped
+			// seat trades a working account for an instant rate limit —
+			// and a bounce right back at the next Stop.
+			if modelCapped(cache, c.cacheKey()) {
+				continue
 			}
 			priority = c
 			break
@@ -166,16 +222,22 @@ func ShouldRebalance(
 		var bestUtil float64 = -1
 		for i := range accounts {
 			c := &accounts[i]
-			if c.Email == current.Email {
+			if sameSeat(*c, current) {
 				continue
 			}
 			if !isAvailable(cache, c.cacheKey()) {
+				continue
+			}
+			if staleReading(cache, c.cacheKey(), now) {
 				continue
 			}
 			if u, ok := cache[c.cacheKey()]; ok {
 				if over, _ := usage.IsOverThreshold(u, thresholds); over {
 					continue
 				}
+			}
+			if modelCapped(cache, c.cacheKey()) {
+				continue
 			}
 			u := sevenDayUtil(cache, c.cacheKey())
 			if u > bestUtil {
@@ -186,10 +248,10 @@ func ShouldRebalance(
 		priority = best
 	}
 
-	if priority == nil || priority.Email == current.Email {
+	if priority == nil || sameSeat(*priority, current) {
 		return Pick{}, false
 	}
-	return Pick{Email: priority.Email, Reason: "rebalance to priority account"}, true
+	return Pick{Email: priority.Email, Slot: priority.Slot, Reason: "rebalance to priority account"}, true
 }
 
 // --- internals -----------------------------------------------------------
@@ -215,24 +277,42 @@ func pickDrain(
 	if cap5 == 0 || cap5 == 100 {
 		cap5 = 90
 	}
-	for _, c := range ordered {
-		if !isAvailable(cache, c.cacheKey()) {
-			continue
-		}
-		if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < float64(cap7) {
-			return Pick{Email: c.Email, Reason: "drain: 7d under cap"}, true
+	// Each pass runs twice: first over candidates whose model-specific
+	// weekly windows (Opus/Sonnet) still have room, then over the rest.
+	// Model windows never make an account ineligible — anthropool cannot know
+	// which model the wrapped session will ask for next — but a
+	// model-capped account is a worse first choice: a heavy-Opus
+	// session swapped onto it rate-limits on its next call. When every
+	// candidate is model-capped the second sweep restores today's pick,
+	// so a pool is never stranded by this preference.
+	for _, preferModelClear := range []bool{true, false} {
+		for _, c := range ordered {
+			if preferModelClear && modelCapped(cache, c.cacheKey()) {
+				continue
+			}
+			if !isAvailable(cache, c.cacheKey()) {
+				continue
+			}
+			if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < float64(cap7) {
+				return Pick{Email: c.Email, Slot: c.Slot, Reason: "drain: 7d under cap"}, true
+			}
 		}
 	}
 
 	// Pass 2: 5h has any room — but never pick a 7D-hard-full account.
 	// A 7D-at-100% account has no recoverable capacity in this window
 	// regardless of 5h utilisation.
-	for _, c := range ordered {
-		if !isAvailable(cache, c.cacheKey()) {
-			continue
-		}
-		if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < 100 {
-			return Pick{Email: c.Email, Reason: "drain: 5h has room"}, true
+	for _, preferModelClear := range []bool{true, false} {
+		for _, c := range ordered {
+			if preferModelClear && modelCapped(cache, c.cacheKey()) {
+				continue
+			}
+			if !isAvailable(cache, c.cacheKey()) {
+				continue
+			}
+			if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < 100 {
+				return Pick{Email: c.Email, Slot: c.Slot, Reason: "drain: 5h has room"}, true
+			}
 		}
 	}
 
@@ -242,7 +322,7 @@ func pickDrain(
 func pickBalanced(accounts []Candidate, current Candidate, cache usage.Cache, thresholds usage.Thresholds) (Pick, bool) {
 	candidates := make([]Candidate, 0, len(accounts))
 	for _, c := range accounts {
-		if c.Email == current.Email {
+		if sameSeat(c, current) {
 			continue
 		}
 		if !isAvailable(cache, c.cacheKey()) {
@@ -260,13 +340,19 @@ func pickBalanced(accounts []Candidate, current Candidate, cache usage.Cache, th
 		return Pick{}, false
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		// Model-capped accounts stay eligible but sort last — see the
+		// rationale on modelCapped.
+		mi, mj := modelCapped(cache, candidates[i].cacheKey()), modelCapped(cache, candidates[j].cacheKey())
+		if mi != mj {
+			return !mi
+		}
 		ai, bi := sevenDayUtil(cache, candidates[i].cacheKey()), sevenDayUtil(cache, candidates[j].cacheKey())
 		if ai != bi {
 			return ai < bi
 		}
 		return fiveHourUtil(cache, candidates[i].cacheKey()) < fiveHourUtil(cache, candidates[j].cacheKey())
 	})
-	return Pick{Email: candidates[0].Email, Reason: "balanced: lowest 7d"}, true
+	return Pick{Email: candidates[0].Email, Slot: candidates[0].Slot, Reason: "balanced: lowest 7d"}, true
 }
 
 // orderedCandidates returns the drain-mode evaluation order: the
@@ -277,7 +363,7 @@ func orderedCandidates(order []string, accounts []Candidate, current Candidate, 
 	if len(order) == 0 {
 		out := make([]Candidate, 0, len(accounts))
 		for _, c := range accounts {
-			if c.Email == current.Email {
+			if sameSeat(c, current) {
 				continue
 			}
 			out = append(out, c)
@@ -289,14 +375,69 @@ func orderedCandidates(order []string, accounts []Candidate, current Candidate, 
 	}
 	out := make([]Candidate, 0, len(order))
 	for _, email := range order {
-		if email == current.Email {
-			continue
-		}
-		if c := findByEmail(accounts, email); c != nil {
-			out = append(out, *c)
+		// An email in the priority list may match several seats (personal
+		// + org). Keep them all, in list order, minus the current seat.
+		for i := range accounts {
+			if accounts[i].Email != email || sameSeat(accounts[i], current) {
+				continue
+			}
+			out = append(out, accounts[i])
 		}
 	}
 	return out
+}
+
+// modelCapped reports whether any window outside the account-wide pair
+// sits at its hard cap. Only >=100 counts: user thresholds express intent
+// about the account-wide windows, not the per-model ones, and a window the
+// plan does not report is simply absent — which reads as room, like every
+// other missing window.
+//
+// Every reported window counts, not a fixed Opus/Sonnet pair (#52). The
+// widening is deliberate and its downside is bounded: this value only ever
+// *sorts* candidates, as the caller's rationale explains, so the worst a
+// window at 100% that says nothing about model health can do is cost a seat
+// its place as first pick. Against that, a closed set meant a seat capped on
+// anything newer read as perfectly healthy, which is the failure that was
+// actually observed.
+//
+// Note this reads `overage` (the "usage credit limit") as model-capped, while
+// the wrapper's modelLimit treats that same limit as account-wide and lets it
+// rotate the seat. The two are meant to disagree: this value only sorts
+// candidates, where counting a spent credit window as a reason to prefer
+// another seat is right; that one chooses an action, where answering a credit
+// cap by changing model would not help. Reconciling them in either direction
+// would break whichever side was already correct.
+func modelCapped(cache usage.Cache, key string) bool {
+	u, ok := cache[key]
+	if !ok {
+		return false
+	}
+	for _, w := range u.Models {
+		if w != nil && w.Utilization >= 100 {
+			return true
+		}
+	}
+	return false
+}
+
+// settledCache clears every reading's elapsed windows (usage.Settled), so
+// the helpers below never have to reason about the clock. PolledAt survives
+// the copy, which is what keeps staleReading usable afterwards.
+func settledCache(cache usage.Cache, now time.Time) usage.Cache {
+	out := make(usage.Cache, len(cache))
+	for k, u := range cache {
+		out[k] = u.Settled(now)
+	}
+	return out
+}
+
+// staleReading reports whether key's reading is too old to act on. A key
+// with no entry is not stale — it is unpolled, and the callers treat that as
+// available so a fresh install can still pick an account.
+func staleReading(cache usage.Cache, key string, now time.Time) bool {
+	u, ok := cache[key]
+	return ok && u.StaleReading(now)
 }
 
 func isAvailable(cache usage.Cache, email string) bool {

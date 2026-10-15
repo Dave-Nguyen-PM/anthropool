@@ -3,9 +3,10 @@ module github.com/Dave-Nguyen-PM/anthropool
 go 1.25.9
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/zalando/go-keyring v0.2.8
-	golang.org/x/sys v0.28.0
-	golang.org/x/term v0.27.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.45.0
 )
 
 require (

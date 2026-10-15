@@ -2,8 +2,9 @@
 // the on-disk usage cache fresh.
 //
 // Call sites:
-//   - The wrapper triggers RefreshActive(email) after each Stop signal
-//     so the cache mirrors reality without flooding the API.
+//   - The wrapper triggers RefreshActiveCoalesced(email, …) after each Stop
+//     signal so the cache mirrors reality without flooding the API — many
+//     sessions ending turns at once collapse to one fetch.
 //   - The wrapper triggers RefreshAll() once at startup, in a
 //     background goroutine, so threshold checks have something to
 //     work with on the first turn.
@@ -18,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/claudecfg"
@@ -35,6 +37,33 @@ const lockTimeout = 10 * time.Second
 // errors so the caller can surface them without aborting the whole
 // refresh — one expired token shouldn't poison the others.
 func RefreshAll() (usage.Cache, []error) {
+	return refreshAll(0)
+}
+
+// RefreshAllCoalesced refreshes only the accounts whose cached reading is
+// missing or older than maxAge. Because the refresh holds a cross-process
+// file lock, N sessions that all poll within the same maxAge window
+// collapse to a single API sweep: the first through the lock fetches, the
+// rest find a fresh-enough cache and skip. This is the relief for the
+// usage endpoint 429ing once many anthropool terminals poll at once (issue #39,
+// related to #21). A maxAge <= 0 is identical to RefreshAll — every
+// account is fetched — so freshness-critical callers keep using RefreshAll.
+func RefreshAllCoalesced(maxAge time.Duration) (usage.Cache, []error) {
+	return refreshAll(maxAge)
+}
+
+// freshEnough reports whether an entry polled at polledAt is recent enough
+// that a coalesced refresh may skip re-fetching it. A zero polledAt (never
+// polled) or a non-positive maxAge (coalescing off) is never fresh enough,
+// so those always fetch.
+func freshEnough(polledAt time.Time, maxAge time.Duration, now time.Time) bool {
+	if maxAge <= 0 || polledAt.IsZero() {
+		return false
+	}
+	return now.Sub(polledAt) < maxAge
+}
+
+func refreshAll(maxAge time.Duration) (usage.Cache, []error) {
 	if err := os.MkdirAll(paths.BackupRoot(), 0o700); err != nil {
 		return nil, []error{fmt.Errorf("monitor: mkdir data dir: %w", err)}
 	}
@@ -55,30 +84,147 @@ func RefreshAll() (usage.Cache, []error) {
 	if cache == nil {
 		cache = usage.Cache{}
 	}
-	var errs []error
+	// Repair seat identities first: a backfill changes cache keys, so it has
+	// to happen before anything is looked up or written under the old ones.
+	// This holds the state lock already, which is what the repair needs.
+	repaired := false
+	if renames := state.BackfillIdentities(); len(renames) > 0 {
+		for old, current := range renames {
+			u, had := cache[old]
+			delete(cache, old)
+			if had && current != "" {
+				cache[current] = u
+			}
+		}
+		repaired = true
+	}
+	// Fetch all accounts in parallel — latency is dominated by the API
+	// round-trip, so N sequential calls cost N× more than needed. Under
+	// coalescing (maxAge > 0), skip any account another session already
+	// refreshed within maxAge — the shared cache holds a current-enough
+	// reading, gated per account so a newly-added or last-errored seat is
+	// still fetched.
+	now := time.Now()
+	type result struct {
+		cacheKey string
+		entry    usage.AccountUsage
+		err      error
+		email    string
+	}
+	ch := make(chan result, len(state.Accounts))
+	var wg sync.WaitGroup
+	fetched := 0
+	var cooling []string
 	for slot, a := range state.Accounts {
-		entry, err := refreshOne(slot, a.Email, a.OrgUUID)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", a.Email, err))
+		if u, ok := cache[a.CacheKey()]; ok {
+			if freshEnough(u.PolledAt, maxAge, now) {
+				continue
+			}
+			// Held back after a refusal, and deliberately regardless of
+			// maxAge: an uncoalesced caller wanting a current reading is
+			// exactly who kept re-asking the seat that could not answer.
+			if u.InCooldown(now) {
+				cooling = append(cooling, fmt.Sprintf("%s: rate limited, next poll %s",
+					a.Email, u.RetryAfter.Local().Format("15:04:05")))
+				continue
+			}
+		}
+		fetched++
+		wg.Add(1)
+		others := make([]store.Account, 0, len(state.Accounts))
+		for otherSlot, other := range state.Accounts {
+			if otherSlot != slot {
+				others = append(others, other)
+			}
+		}
+		go func(slot int, a store.Account, others []store.Account) {
+			defer wg.Done()
+			entry, err := refreshOne(slot, a.Email, a.OrgUUID, others)
+			ch <- result{cacheKey: a.CacheKey(), entry: entry, err: err, email: a.Email}
+		}(slot, a, others)
+	}
+	wg.Wait()
+	close(ch)
+
+	var errs []error
+	dirty := repaired
+	for r := range ch {
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.email, r.err))
 			// On token-expired we still cache the marker so `anthropool list`
 			// surfaces the state to the user.
-			if entry.TokenExpired {
-				cache[a.CacheKey()] = entry
+			if r.entry.TokenExpired {
+				cache[r.cacheKey] = r.entry
+				dirty = true
+				continue
 			}
+			// Every other failure is recorded against the reading we already
+			// hold, so the next caller can see that this account was asked
+			// and refused. Without it PolledAt stays at the last success, the
+			// entry reads stale forever, and staleness is what makes the next
+			// caller fetch — the seat that fails is then the one polled
+			// hardest (#53).
+			kept := cache[r.cacheKey]
+			kept.Failures++
+			var limited *usage.RateLimitedError
+			named := time.Duration(0)
+			if errors.As(r.err, &limited) {
+				named = limited.RetryAfter
+			}
+			kept.RetryAfter = kept.NextRetry(time.Now(), named)
+			cache[r.cacheKey] = kept
+			dirty = true
 			continue
 		}
-		cache[a.CacheKey()] = entry
+		// A success clears the hold-off; the account is answering again.
+		r.entry.RetryAfter, r.entry.Failures = time.Time{}, 0
+		cache[r.cacheKey] = r.entry
+		dirty = true
 	}
-	if err := usage.SaveCache(cache); err != nil {
-		errs = append(errs, err)
+	for _, c := range cooling {
+		errs = append(errs, errors.New(c))
+	}
+	// When nothing was fetched or repaired the cache is untouched, so skip
+	// the write entirely — that no-op is the whole point of coalescing. A
+	// recorded refusal counts as a change: it is what stops the next caller
+	// asking the same account again.
+	if dirty {
+		if err := usage.SaveCache(cache); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if repaired {
+		if err := state.Save(); err != nil {
+			errs = append(errs, fmt.Errorf("monitor: save repaired identities: %w", err))
+		}
 	}
 	return cache, errs
 }
 
-// RefreshActive refreshes one account by email. Used by the wrapper
-// after each Stop signal to keep the active account's cache entry
-// current before threshold evaluation.
-func RefreshActive(email string) error {
+// RefreshActive refreshes one account by email, unconditionally.
+func RefreshActive(email string) error { return refreshActive(email, 0) }
+
+// RefreshActiveCoalesced refreshes one account unless another session
+// already polled it within maxAge.
+//
+// The wrapper calls this after every Stop signal, so on a busy host the
+// request rate is (sessions × turns), all aimed at the one account they
+// share — which is why the *active* seat 429s continuously while an idle
+// seat in the same pool refreshes normally (#53). The lock alone does not
+// help: it serialises those fetches, it does not remove them.
+//
+// maxAge is a genuine trade, not free deduplication. This reading feeds
+// threshold evaluation on the very next line of the wrapper's Stop
+// handler, so a wide window hands stale utilisation to the decision that
+// is already criticised for arriving late (#49). Keep it near
+// refreshCoalesceWindow: long enough that N sessions ending turns together
+// collapse to one fetch, short enough that no threshold check ever reasons
+// about a materially older number than it does today.
+func RefreshActiveCoalesced(email string, maxAge time.Duration) error {
+	return refreshActive(email, maxAge)
+}
+
+func refreshActive(email string, maxAge time.Duration) error {
 	if email == "" {
 		return errors.New("monitor: empty email")
 	}
@@ -100,7 +246,6 @@ func RefreshActive(email string) error {
 		return fmt.Errorf("monitor: %s not managed by anthropool", email)
 	}
 	acct := state.Accounts[slot]
-	entry, err := refreshOne(slot, acct.Email, acct.OrgUUID)
 	cache, cacheErr := usage.LoadCache()
 	if cacheErr != nil {
 		return cacheErr
@@ -108,6 +253,19 @@ func RefreshActive(email string) error {
 	if cache == nil {
 		cache = usage.Cache{}
 	}
+	// Checked under the lock, so of N sessions arriving together exactly one
+	// fetches and the rest find its reading already written.
+	if u, ok := cache[acct.CacheKey()]; ok && freshEnough(u.PolledAt, maxAge, time.Now()) {
+		return nil
+	}
+
+	others := make([]store.Account, 0, len(state.Accounts))
+	for otherSlot, other := range state.Accounts {
+		if otherSlot != slot {
+			others = append(others, other)
+		}
+	}
+	entry, err := refreshOne(slot, acct.Email, acct.OrgUUID, others)
 	if err != nil && !entry.TokenExpired {
 		// Network blips shouldn't blow away the prior entry.
 		return err
@@ -125,7 +283,11 @@ func RefreshActive(email string) error {
 //  2. If the API still returns 401 (e.g. the refresh token itself expired):
 //     fall back to the live credentials file, but only when the live account
 //     email and orgUUID match, to avoid using a different account's token.
-func refreshOne(slot int, email, orgUUID string) (usage.AccountUsage, error) {
+//
+// refreshOne polls one account. others is the rest of the managed pool, used
+// only on the post-401 fallback path to check a live token is not already
+// filed under another slot; pass nil to skip that check.
+func refreshOne(slot int, email, orgUUID string, others []store.Account) (usage.AccountUsage, error) {
 	blob, err := creds.ReadBackup(slot, email)
 	if err != nil {
 		return usage.AccountUsage{}, err
@@ -190,9 +352,35 @@ func refreshOne(slot int, email, orgUUID string) (usage.AccountUsage, error) {
 	if err2 != nil {
 		return u, err
 	}
-	// Live token worked — update the backup so the next refresh uses it.
-	// Best-effort: if this fails we still return the valid usage data.
-	_ = creds.WriteBackup(slot, email, liveBlob)
+	// Live token worked, so adopt it into the slot — that is what makes a
+	// `claude login` without a `anthropool add` self-heal on the next refresh.
+	//
+	// But the check that got us here compared the *identity file* against
+	// this slot's email, and that file is exactly what can disagree with the
+	// credential store (issue #46). Passing it does not establish that the
+	// live token belongs to this account, so adopting on that basis alone is
+	// how one account's token ends up filed under another's name — the same
+	// corruption `anthropool add` and `anthropool switch` now refuse, arriving through a
+	// background refresh instead of a command.
+	//
+	// So prove it negatively before writing: if this token is already stored
+	// under a different slot, it is not this account's. The scan reads the
+	// other slots' backups, which is why it lives here on the post-401 path
+	// rather than in the refresh proper — a dead stored token is rare, while
+	// refreshAll runs at every session start, Stop signal and idle check.
+	//
+	// On a collision, keep the reading and skip the write. The figure is
+	// still worth having, and leaving the stale backup in place keeps the
+	// slot repairable by `anthropool add`, which can attribute the token properly.
+	// `anthropool status` reports pools already in this state.
+	refs := make([]creds.SlotRef, 0, len(others))
+	for _, o := range others {
+		refs = append(refs, creds.SlotRef{Slot: o.Slot, Email: o.Email})
+	}
+	if _, shared := creds.SlotHoldingToken(refs, slot, liveBlob); !shared {
+		// Best-effort: if this fails we still return the valid usage data.
+		_ = creds.WriteBackup(slot, email, liveBlob)
+	}
 	return u2, nil
 }
 

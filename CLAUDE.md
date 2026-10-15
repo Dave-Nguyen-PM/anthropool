@@ -43,6 +43,12 @@ internal/
   lockfile/         Cross-platform advisory lock
   atomicfile/       Atomic write helper (temp + rename)
   updater/          GitHub release check + upgrade command
+  ptyhost/          PTY host that makes a session attachable (`anthropool attach`)
+  registry/         Heartbeat registry of running wrappers (`anthropool sessions`)
+  session/          Captures the running Claude Code session ID for --resume
+  transcripts/      Per-project usage stats derived from Claude Code transcripts
+  supportnotice/    Throttled support line on exit / after upgrade
+  branding/         ASCII banner shown at install / setup
 npm/                npm package (postinstall downloads the binary)
 scripts/install.sh  Curl installer
 slashcmd/           /switch markdown source

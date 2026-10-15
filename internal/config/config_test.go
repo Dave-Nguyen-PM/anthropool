@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -30,8 +31,8 @@ func TestDefaultsLoaded_WhenFileMissing(t *testing.T) {
 	if c.AutoMessage != def.AutoMessage {
 		t.Errorf("auto_message: got %q, want %q", c.AutoMessage, def.AutoMessage)
 	}
-	if c.UpdateCheck.Enabled {
-		t.Error("update_check.enabled should default to false")
+	if !c.UpdateCheck.Enabled {
+		t.Error("update_check.enabled should default to true")
 	}
 	if c.UpdateCheck.CadenceHours != 6 {
 		t.Errorf("update_check.cadence_hours = %d, want 6", c.UpdateCheck.CadenceHours)
@@ -165,5 +166,33 @@ func TestResolvedStrategy(t *testing.T) {
 	c.Strategy.Kind = "balanced"
 	if c.ResolvedStrategy().String() != "balanced" {
 		t.Fatalf("ResolvedStrategy = %v", c.ResolvedStrategy())
+	}
+}
+
+func TestSetModelFallback(t *testing.T) {
+	c := Defaults()
+	if len(c.ModelFallback) != 0 {
+		t.Fatalf("default model_fallback = %v, want empty so existing installs are unchanged", c.ModelFallback)
+	}
+
+	c, err := Set(c, "model_fallback", " opus , sonnet ,, ")
+	if err != nil {
+		t.Fatalf("Set model_fallback: %v", err)
+	}
+	if want := []string{"opus", "sonnet"}; !reflect.DeepEqual(c.ModelFallback, want) {
+		t.Errorf("model_fallback = %v, want %v", c.ModelFallback, want)
+	}
+
+	// Clearing it has to be reachable, including through a shell that
+	// delivers an empty argument as a literal pair of quotes.
+	for _, clear := range []string{"", `""`} {
+		c, err = Set(c, "model_fallback", clear)
+		if err != nil {
+			t.Fatalf("Set model_fallback %q: %v", clear, err)
+		}
+		if len(c.ModelFallback) != 0 {
+			t.Errorf("model_fallback after clearing with %q = %v, want empty", clear, c.ModelFallback)
+		}
+		c, _ = Set(c, "model_fallback", "opus")
 	}
 }

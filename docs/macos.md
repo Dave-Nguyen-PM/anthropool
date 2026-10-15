@@ -5,7 +5,7 @@
 All three methods work on macOS. npm is the fastest:
 
 ```bash
-npm install -g /anthropool
+npm install -g @Dave-Nguyen-PM/anthropool
 anthropool setup
 ```
 

@@ -36,6 +36,8 @@ const (
 	Stopped         Name = "stopped"
 	RateLimited     Name = "rate-limited"
 	SwitchRequested Name = "switch-requested"
+	TurnFailed      Name = "turn-failed"
+	PromptSubmitted Name = "prompt-submitted"
 )
 
 // Payloads. Match claude-revolver's shapes for hook-emitted signals so
@@ -64,6 +66,26 @@ type SwitchRequestedPayload struct {
 	Target        string    `json:"target,omitempty"`
 	ResumeMessage string    `json:"resumeMessage,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
+}
+
+// TurnFailedPayload marks a turn that died on a non-rate-limit API
+// error after Claude Code exhausted its own retries.
+type TurnFailedPayload struct {
+	Timestamp time.Time `json:"timestamp"`
+	Message   string    `json:"message,omitempty"`
+}
+
+// PromptSubmittedPayload marks the user typing something — the wrapper's
+// only evidence that a human is present, since nothing else it observes
+// distinguishes a session parked at an empty prompt from one mid-turn.
+//
+// StartsTurn is false for a prompt the hook handled itself (a /switch, a
+// /anthropool:* command, an intercepted threshold swap): those never reach the
+// model, so no Stop will follow them. Treating one as the start of a turn
+// would leave the session looking busy forever.
+type PromptSubmittedPayload struct {
+	Timestamp  time.Time `json:"timestamp"`
+	StartsTurn bool      `json:"startsTurn"`
 }
 
 // Dir returns the absolute signal directory. Callers that intend to
@@ -162,6 +184,16 @@ func DecodeStopped(b []byte) (StoppedPayload, error) {
 	return p, err
 }
 
+// DecodePromptSubmitted is a convenience for the wrapper.
+func DecodePromptSubmitted(b []byte) (PromptSubmittedPayload, error) {
+	var p PromptSubmittedPayload
+	if len(b) == 0 {
+		return p, nil
+	}
+	err := json.Unmarshal(b, &p)
+	return p, err
+}
+
 // DecodeSwitchRequested is a convenience for the wrapper.
 func DecodeSwitchRequested(b []byte) (SwitchRequestedPayload, error) {
 	var p SwitchRequestedPayload
@@ -175,6 +207,16 @@ func DecodeSwitchRequested(b []byte) (SwitchRequestedPayload, error) {
 // DecodeRateLimited is a convenience for the wrapper.
 func DecodeRateLimited(b []byte) (RateLimitedPayload, error) {
 	var p RateLimitedPayload
+	if len(b) == 0 {
+		return p, nil
+	}
+	err := json.Unmarshal(b, &p)
+	return p, err
+}
+
+// DecodeTurnFailed is a convenience for the wrapper.
+func DecodeTurnFailed(b []byte) (TurnFailedPayload, error) {
+	var p TurnFailedPayload
 	if len(b) == 0 {
 		return p, nil
 	}

@@ -11,7 +11,7 @@ Three ways to install `anthropool`. Pick the one that fits your setup.
 Works on Linux, macOS, and Windows. Requires Node.js 18 or newer.
 
 ```bash
-npm install -g /anthropool
+npm install -g @Dave-Nguyen-PM/anthropool
 ```
 
 After install, run the setup command once:
@@ -139,7 +139,7 @@ If `anthropool` runs but prints "binary not found", the postinstall script could
 Re-trigger it:
 
 ```bash
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 **Corporate proxy:**
@@ -148,7 +148,7 @@ npm install -g /anthropool --force
 # Set proxy before install
 export HTTPS_PROXY=http://proxy.corp.example.com:8080   # Linux/macOS
 set HTTPS_PROXY=http://proxy.corp.example.com:8080      # Windows cmd
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 **Fully offline:** Download the binary directly from the [releases page](https://github.com/Dave-Nguyen-PM/anthropool/releases/latest) and drop it at the path shown in the error message (`…/bin/anthropool` on Linux/macOS, `…\bin\anthropool.exe` on Windows).
@@ -157,7 +157,7 @@ npm install -g /anthropool --force
 
 ## WSL
 
-Run `npm install -g /anthropool` inside WSL — it downloads the Linux binary. Do not use the Windows anthropool binary from within WSL. See [Linux guide](./linux.md#wsl-windows-subsystem-for-linux) for PATH and interop notes.
+Run `npm install -g @Dave-Nguyen-PM/anthropool` inside WSL — it downloads the Linux binary. Do not use the Windows anthropool binary from within WSL. See [Linux guide](./linux.md#wsl-windows-subsystem-for-linux) for PATH and interop notes.
 
 ---
 

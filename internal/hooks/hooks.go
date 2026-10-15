@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/config"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/monitor"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/paths"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/signals"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/store"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/strategy"
@@ -62,16 +64,33 @@ type sessionStartHookInput struct {
 type rateLimitHookInput struct {
 	// error is json.RawMessage so we can handle both string and object
 	// shapes that different Claude Code versions may emit.
-	Error json.RawMessage `json:"error,omitempty"`
+	Error                json.RawMessage `json:"error,omitempty"`
+	ErrorDetails         json.RawMessage `json:"error_details,omitempty"`
+	LastAssistantMessage json.RawMessage `json:"last_assistant_message,omitempty"`
+	HookEventName        string          `json:"hook_event_name,omitempty"`
 }
 
 type userPromptSubmitHookInput struct {
 	Prompt string `json:"prompt"`
 }
 
+type userPromptExpansionHookInput struct {
+	CommandName string `json:"command_name,omitempty"`
+	Prompt      string `json:"prompt,omitempty"`
+}
+
 type userPromptSubmitHookOutput struct {
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
+}
+
+type sessionStartHookOutput struct {
+	HookSpecificOutput sessionStartSpecificOutput `json:"hookSpecificOutput"`
+}
+
+type sessionStartSpecificOutput struct {
+	HookEventName     string `json:"hookEventName"`
+	AdditionalContext string `json:"additionalContext"`
 }
 
 // UserPromptSubmit is `anthropool hook prompt-submit`. It intercepts anthropool's
@@ -91,75 +110,244 @@ func UserPromptSubmit(stdin io.Reader, stdout io.Writer) error {
 	if prompt == "" {
 		return nil
 	}
+	// Every branch below reports the prompt to the wrapper, which uses it
+	// as the "a human is here" clock for idle migration (#39). Only the
+	// fall-through at the end starts a model turn; the branches that handle
+	// the prompt themselves block it, so no Stop ever follows them.
 	if prompt == "/switch" || strings.HasPrefix(prompt, "/switch ") {
-		target := strings.TrimSpace(strings.TrimPrefix(prompt, "/switch"))
-		writePromptSwitch(target, stdout)
-		return nil
+		notePromptSubmitted(false)
+		return runSlashSwitch(strings.TrimSpace(strings.TrimPrefix(prompt, "/switch")), stdout)
 	}
 	if handled, err := handleAnthropoolPromptCommand(prompt, stdout); handled || err != nil {
+		notePromptSubmitted(false)
 		return err
 	}
 	if handled, err := handleAutoSwitchPrompt(prompt, stdout); handled || err != nil {
+		notePromptSubmitted(false)
 		return err
 	}
+	notePromptSubmitted(true)
+	return nil
+}
+
+// notePromptSubmitted tells the wrapper the user just typed something.
+// Best-effort by design: a failed write must never block the prompt, it
+// only costs this session an idle migration it might otherwise have got.
+func notePromptSubmitted(startsTurn bool) {
+	pid, err := wrapperPID()
+	if err != nil {
+		return
+	}
+	_ = signals.Write(pid, signals.PromptSubmitted, signals.PromptSubmittedPayload{
+		Timestamp:  time.Now().UTC(),
+		StartsTurn: startsTurn,
+	})
+}
+
+func UserPromptExpansion(stdin io.Reader, stdout io.Writer) error {
+	if !isWrapped() {
+		return nil
+	}
+	var in userPromptExpansionHookInput
+	if err := decode(stdin, &in); err != nil {
+		return nil
+	}
+	cmd := strings.TrimPrefix(strings.TrimSpace(in.CommandName), "/")
+	prompt := strings.TrimSpace(in.Prompt)
+	if cmd != "rate-limit-options" && prompt != "/rate-limit-options" {
+		return nil
+	}
+
+	if handled, err := handleAutoSwitchPrompt("/rate-limit-options", stdout); handled || err != nil {
+		return nil
+	}
+
+	if msg, err := renderPromptUsage(true); err == nil {
+		writePromptBlock(stdout, msg)
+		return nil
+	}
+	writePromptBlock(stdout, "anthropool: session limit reached; no usable managed account is available right now.")
 	return nil
 }
 
 func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
-	target, reason, ok := promptAutoSwitchTarget()
-	if !ok {
-		return false, nil
-	}
-	pid, err := wrapperPID()
-	if err != nil {
-		return false, err
-	}
-	if err := signals.Write(pid, signals.SwitchRequested, signals.SwitchRequestedPayload{
-		Target:        target,
-		ResumeMessage: prompt,
-		Timestamp:     time.Now().UTC(),
-	}); err != nil {
-		return false, err
-	}
-	writePromptBlock(stdout, "anthropool: "+reason+"\nanthropool: switching accounts and replaying your prompt after resume...")
-	return true, nil
-}
+	// Consume the replay flag written by the wrapper before relaunching.
+	// This prevents triggering another switch when the replayed prompt
+	// lands on an account that is also near threshold.
+	isReplay := consumeReplayFlag()
 
-func promptAutoSwitchTarget() (target, reason string, ok bool) {
 	cfg, err := config.Load()
 	if err != nil || !cfg.AutoSwitchOnThreshold {
-		return "", "", false
+		return false, nil
 	}
 	email, err := switcher.CurrentLiveEmail()
 	if err != nil {
-		return "", "", false
+		return false, nil
 	}
-	cache, err := usage.LoadCache()
-	if err != nil || cache == nil {
-		return "", "", false
+	// Use the real cache key (OrgUUID when present, email otherwise).
+	// Accounts in an org are keyed by OrgUUID in the usage cache, so a
+	// bare email lookup silently misses and the threshold check never fires.
+	cacheKey, err := switcher.CurrentLiveCacheKey()
+	if err != nil {
+		return false, nil
 	}
-	u, ok := cache[email]
-	if !ok {
-		return "", "", false
+
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
 	}
-	over, why := usage.IsOverThreshold(u, cfg.Thresholds)
+	u, uOK := cachedUsage(cache, cacheKey, email)
+	if !uOK {
+		return false, nil
+	}
+	hookNow := time.Now()
+	// This hook can hold up the user's prompt and restart their session, so
+	// it must not fire on a reading that no longer describes the present
+	// (issue #46). The refresh below would heal an ordinary lag; when it
+	// cannot — credentials unreadable — doing nothing is the safe answer,
+	// and the pool view now says why rather than looking healthy.
+	if u.StaleReading(hookNow) {
+		return false, nil
+	}
+	over, why := usage.IsOverThresholdAt(u, cfg.Thresholds, hookNow)
 	if !over {
-		return "", "", false
+		return false, nil
 	}
+
+	// Refresh all accounts before picking a target. The cache may be stale
+	// (e.g. a candidate's 5h window has reset since the last poll) and we
+	// must not switch to an account that looks exhausted only because the
+	// cache hasn't caught up yet. The hook timeout is 20 s so a refresh
+	// here is safe.
+	if fresh, _ := monitor.RefreshAll(); fresh != nil {
+		cache = fresh
+		// Re-read the current account from the fresh cache.
+		if freshU, ok := cachedUsage(fresh, cacheKey, email); ok {
+			u = freshU
+			// If the current account itself has recovered (e.g. its 5h window
+			// just reset), don't switch — let the prompt through. A refresh
+			// that failed leaves the old reading here, so re-check staleness
+			// too rather than acting on what the refresh could not replace.
+			if u.StaleReading(hookNow) {
+				return false, nil
+			}
+			if newOver, _ := usage.IsOverThresholdAt(u, cfg.Thresholds, hookNow); !newOver {
+				return false, nil
+			}
+		}
+	}
+
 	state, err := store.Load()
 	if err != nil {
-		return "", "", false
+		return false, nil
 	}
-	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
-	for _, a := range state.Accounts {
-		candidates = append(candidates, strategy.Candidate{Email: a.Email})
+	pool := state.PoolForCwd()
+	candidates := make([]strategy.Candidate, 0, len(pool))
+	for _, a := range pool {
+		candidates = append(candidates, strategy.Candidate{Email: a.Email, Slot: a.Slot, CacheKey: a.CacheKey()})
+	}
+	// Key the live seat the way every candidate is keyed (store.LiveSeat).
+	// Guessing from the cache instead worked only while the cache happened
+	// to hold an entry under one of the two spellings: on a cold cache the
+	// live seat matched no candidate, so rotation failed to exclude it and
+	// the threshold swap could pick the seat it was already on.
+	current := strategy.Candidate{Email: email, CacheKey: cacheKey}
+	if seat, ok := state.LiveSeat(email, cacheKey); ok {
+		current = strategy.Candidate{Email: seat.Email, Slot: seat.Slot, CacheKey: seat.CacheKey()}
+	} else if _, ok := cache[cacheKey]; !ok {
+		if _, emailOK := cache[email]; emailOK {
+			current.CacheKey = email
+		}
 	}
 	pick, picked := strategy.PickNext(cfg.ResolvedStrategy(), cfg.Strategy.Order, candidates,
-		strategy.Candidate{Email: email}, cache, cfg.Thresholds)
-	if !picked {
-		return "", "", false
+		current, cache, cfg.Thresholds, time.Now())
+
+	if picked && !isReplay {
+		// /rate-limit-options is Claude Code's internally-issued slash command
+		// when a session limit fires mid-turn (during tool use). In that case
+		// the turn is already broken — we need the wrapper's kill+resume flow
+		// to reload the session transcript on the new account. Signal the
+		// wrapper and block the command so the menu never appears.
+		if strings.HasPrefix(strings.TrimSpace(prompt), "/rate-limit-options") {
+			pid, err := wrapperPID()
+			if err != nil {
+				// Not running under the wrapper — fall through to in-place swap.
+				goto inPlaceSwap
+			}
+			if err := signals.Write(pid, signals.SwitchRequested, signals.SwitchRequestedPayload{
+				Target:    pick.Identifier(),
+				Timestamp: time.Now().UTC(),
+			}); err != nil {
+				writePromptBlock(stdout, fmt.Sprintf("anthropool: %s\nanthropool: signal failed: %v", why, err))
+				return true, nil
+			}
+			writePromptBlock(stdout, fmt.Sprintf("anthropool: %s\nanthropool: → switching to %s and resuming your session...", why, pick.Email))
+			return true, nil
+		}
+
+	inPlaceSwap:
+		// Pre-turn prompt: swap credentials in-place. Claude Code reads
+		// credentials on every API request, so this prompt will be processed
+		// by the new account with no restart or manual resend needed.
+		from, to, switchErr := switcher.SwitchTo(pick.Identifier())
+		if switchErr != nil {
+			writePromptBlock(stdout, fmt.Sprintf("anthropool: %s\nanthropool: failed to switch to %s: %v", why, pick.Email, switchErr))
+			return true, nil
+		}
+		// Notify on stderr — visible in the terminal even inside the TUI.
+		// Writing nothing to stdout causes Claude Code to approve the prompt,
+		// so it continues on the new account without any manual resend.
+		fmt.Fprintf(os.Stderr, "\nanthropool: %s → %s (%s)\n", from.Email, to.Email, why)
+		return true, nil
 	}
-	return pick.Email, why, true
+
+	if isReplay {
+		// Leftover replay flag from the old wrapper-based switch path.
+		// Let the prompt through — auto-switch re-engages on the next prompt.
+		return false, nil
+	}
+
+	// No usable account found. Show an actionable warning.
+	var b strings.Builder
+	b.WriteString("anthropool: " + why + "\n")
+	b.WriteString("anthropool: all managed accounts are at or above the usage threshold\n")
+
+	// Only suggest raising the threshold when accounts are throttled by it
+	// (not at 100%). At 100% the threshold is irrelevant — only a reset helps.
+	trulyExhausted := (u.FiveHour != nil && u.FiveHour.Utilization >= 100) ||
+		(u.SevenDay != nil && u.SevenDay.Utilization >= 100)
+	if !trulyExhausted {
+		threshold := cfg.Thresholds.FiveHour
+		if threshold == 0 {
+			threshold = 90
+		}
+		suggested := threshold + 10
+		if suggested > 95 {
+			suggested = 95
+		}
+		b.WriteString(fmt.Sprintf("anthropool: threshold is %d%% — raise it with:  /anthropool:config set thresholds.five_hour %d\n",
+			threshold, suggested))
+	}
+
+	if _, resetEmail, reset, ok := nextResetSlot(state, cache); ok {
+		b.WriteString(fmt.Sprintf("anthropool: next reset: %s in %s\n", resetEmail, reset))
+	}
+	b.WriteString("\nResend your prompt after adjusting the threshold or waiting for reset.")
+	writePromptBlock(stdout, strings.TrimRight(b.String(), "\n"))
+	return true, nil
+}
+
+func consumeReplayFlag() bool {
+	pid, err := wrapperPID()
+	if err != nil {
+		return false
+	}
+	flagFile := paths.ReplayFlagFile(pid)
+	if _, err := os.Stat(flagFile); err == nil {
+		_ = os.Remove(flagFile)
+		return true
+	}
+	return false
 }
 
 func handleAnthropoolPromptCommand(prompt string, stdout io.Writer) (bool, error) {
@@ -177,9 +365,7 @@ func handleAnthropoolPromptCommand(prompt string, stdout io.Writer) (bool, error
 	case "add":
 		args = append([]string{"add"}, fields[1:]...)
 	case "switch":
-		target := strings.TrimSpace(strings.TrimPrefix(prompt, "/anthropool:switch"))
-		writePromptSwitch(target, stdout)
-		return true, nil
+		return true, runSlashSwitch(strings.TrimSpace(strings.TrimPrefix(prompt, "/anthropool:switch")), stdout)
 	case "list":
 		refresh := hasArg(fields[1:], "--refresh")
 		text, err := renderPromptUsage(refresh)
@@ -190,7 +376,7 @@ func handleAnthropoolPromptCommand(prompt string, stdout io.Writer) (bool, error
 		writePromptBlock(stdout, text)
 		return true, nil
 	case "status":
-		text, err := renderPromptUsage(false)
+		text, err := renderPromptUsage(true)
 		if err != nil {
 			writePromptBlock(stdout, "anthropool: "+err.Error())
 			return true, nil
@@ -226,6 +412,14 @@ func handleAnthropoolPromptCommand(prompt string, stdout io.Writer) (bool, error
 		return true, nil
 	}
 
+	writePromptBlock(stdout, runAnthropool(args...))
+	return true, nil
+}
+
+// runAnthropool invokes a anthropool subcommand and returns what the user should see. The
+// hook already holds ANTHROPOOL_WRAPPED and ANTHROPOOL_WRAPPER_PID, so the child resolves
+// the same session this hook was fired for.
+func runAnthropool(args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "anthropool", args...)
@@ -235,43 +429,51 @@ func handleAnthropoolPromptCommand(prompt string, stdout io.Writer) (bool, error
 	cmd.Stderr = &out
 	err := cmd.Run()
 	text := strings.TrimSpace(out.String())
-	if ctx.Err() == context.DeadlineExceeded {
-		text = "anthropool: command timed out"
-	} else if err != nil && text == "" {
-		text = "anthropool: " + err.Error()
-	} else if err != nil {
-		text = text + "\n" + "anthropool: command failed: " + err.Error()
-	} else if text == "" {
-		text = "anthropool: done"
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		return "anthropool: command timed out"
+	case err != nil && text == "":
+		return "anthropool: " + err.Error()
+	case err != nil:
+		return text + "\nanthropool: command failed: " + err.Error()
+	case text == "":
+		return "anthropool: done"
 	}
-	writePromptBlock(stdout, text)
-	return true, nil
+	return text
 }
 
-func writePromptSwitch(target string, stdout io.Writer) {
-	if strings.TrimSpace(target) == "" {
+// runSlashSwitch handles a /switch by running the command the slash file
+// would have run, `anthropool __slash-switch`, and showing its result instead of the
+// prompt.
+//
+// It has to be run from here rather than left to expand. This hook fires
+// before prompt processing and a slash command does not reliably expand —
+// least of all on the hard-limited seat where /switch matters most — so the
+// prompt would reach the model as the literal text "/switch" and be answered
+// as a question about switching rather than performed.
+//
+// What changed is only what gets run. This used to signal the wrapper, which
+// stopped claude and relaunched it with --resume; SlashSwitch rewrites the
+// live credential blob and returns, and because credentials are read per
+// request the conversation simply carries on (0a914db). The user asked to
+// change account, not to restart their session.
+func runSlashSwitch(target string, stdout io.Writer) error {
+	target = strings.TrimSpace(target)
+	// Nowhere to rotate to is worth saying here: the command would only fail
+	// or land on another exhausted seat. An explicit target is the user's own
+	// call and is never second-guessed.
+	if target == "" {
 		if ok, text := promptSwitchHasTarget(); !ok {
 			writePromptBlock(stdout, text)
-			return
+			return nil
 		}
 	}
-	pid, err := wrapperPID()
-	if err != nil {
-		writePromptBlock(stdout, "anthropool: "+err.Error())
-		return
+	args := []string{"__slash-switch"}
+	if target != "" {
+		args = append(args, target)
 	}
-	if err := signals.Write(pid, signals.SwitchRequested, signals.SwitchRequestedPayload{
-		Target:    strings.TrimSpace(target),
-		Timestamp: time.Now().UTC(),
-	}); err != nil {
-		writePromptBlock(stdout, "anthropool: "+err.Error())
-		return
-	}
-	reason := "anthropool: switching accounts..."
-	if strings.TrimSpace(target) != "" {
-		reason = "anthropool: switching accounts to " + strings.TrimSpace(target) + "..."
-	}
-	writePromptBlock(stdout, reason)
+	writePromptBlock(stdout, runAnthropool(args...))
+	return nil
 }
 
 func promptSwitchHasTarget() (bool, string) {
@@ -288,17 +490,27 @@ func promptSwitchHasTarget() (bool, string) {
 		cache = usage.Cache{}
 	}
 	current, _ := switcher.CurrentLiveEmail()
-	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
-	for _, a := range state.Accounts {
-		candidates = append(candidates, strategy.Candidate{Email: a.Email})
+	currentKey, _ := switcher.CurrentLiveCacheKey()
+	if seat, ok := state.LiveSeat(current, currentKey); ok {
+		current, currentKey = seat.Email, seat.CacheKey()
+	} else if currentKey == "" {
+		currentKey = current
+	}
+	pool := state.PoolForCwd()
+	candidates := make([]strategy.Candidate, 0, len(pool))
+	for _, a := range pool {
+		candidates = append(candidates, strategy.Candidate{Email: a.Email, Slot: a.Slot, CacheKey: a.CacheKey()})
 	}
 	if _, ok := strategy.PickNext(cfg.ResolvedStrategy(), cfg.Strategy.Order, candidates,
-		strategy.Candidate{Email: current}, cache, cfg.Thresholds); ok {
+		strategy.Candidate{Email: current, CacheKey: currentKey}, cache, cfg.Thresholds, time.Now()); ok {
 		return true, ""
 	}
 	for _, slot := range state.SortedSlots() {
-		acct := state.Accounts[slot]
-		if slot != state.ActiveSlot && accountHasPromptCapacity(cache, acct.Email, cfg.Thresholds) {
+		acct, inPool := pool[slot]
+		if !inPool {
+			continue
+		}
+		if slot != state.ActiveSlot && accountHasPromptCapacity(cache, acct, cfg.Thresholds) {
 			return true, ""
 		}
 	}
@@ -364,9 +576,11 @@ func renderPromptUsage(refresh bool) (string, error) {
 	anyUsable := false
 	slots := state.SortedSlots()
 	sort.Ints(slots)
+	now := time.Now()
 	for i, slot := range slots {
 		acct := state.Accounts[slot]
-		u := cache[acct.Email]
+		u, _ := cachedUsage(cache, acct.CacheKey(), acct.Email)
+		stale := u.StaleReading(now)
 		stateLabel := ""
 		if acct.Email == liveEmail {
 			stateLabel = "active"
@@ -378,13 +592,17 @@ func renderPromptUsage(refresh bool) (string, error) {
 				stateLabel += "+expired"
 			}
 		}
-		if accountHasPromptCapacity(cache, acct.Email, cfg.Thresholds) {
+		if accountHasPromptCapacity(cache, acct, cfg.Thresholds) {
 			anyUsable = true
 		}
 		if stateLabel == "" {
-			stateLabel = capacityLabel(u, cfg.Thresholds)
+			if stale {
+				stateLabel = "stale"
+			} else {
+				stateLabel = capacityLabel(u, cfg.Thresholds)
+			}
 		}
-		b.WriteString(renderAccountRow(slot, acct.Email, u, stateLabel))
+		b.WriteString(renderAccountRow(slot, acct.Email, u, stateLabel, stale))
 		if i != len(slots)-1 {
 			b.WriteString("│      │                           │        │                      │                      │        │\n")
 		}
@@ -396,11 +614,27 @@ func renderPromptUsage(refresh bool) (string, error) {
 			b.WriteString(fmt.Sprintf("\nNEXT RESET : SLOT [%02d] %s  IN %s", slot, email, reset))
 		}
 		b.WriteString("\nACTION : WAIT FOR RESET OR ADD ANOTHER ACCOUNT")
-	} else if slot, email, reset, ok := nextUsableSlot(state, cache, cfg.Thresholds); ok {
+	} else if slot, email, reset, ok := nextUsableSlot(state, cache, cfg.Thresholds, now); ok {
 		b.WriteString(fmt.Sprintf("\n\nNEXT USABLE : SLOT [%02d] %s", slot, email))
 		if reset != "" {
 			b.WriteString("  RESET " + reset)
 		}
+	}
+	// Independent of the refresh flag: the warnings below only exist when
+	// this invocation tried to poll, but a frozen cache has to announce
+	// itself on every read (issue #46).
+	keys := make([]string, 0, len(state.Accounts))
+	for _, slot := range slots {
+		keys = append(keys, state.Accounts[slot].CacheKey())
+	}
+	if sn := cache.Staleness(keys, now); sn.Any() {
+		scope := fmt.Sprintf("%d OF %d ACCOUNTS", sn.Stale, sn.Total)
+		if sn.All() {
+			scope = "EVERY ACCOUNT"
+		}
+		b.WriteString(fmt.Sprintf("\n\nWARNING: USAGE DATA STALE — %s LAST POLLED %s AGO. "+
+			"THE FIGURES ABOVE ARE NOT CURRENT; RUN `anthropool usage refresh` IN A SHELL TO SEE WHY POLLING IS FAILING.",
+			scope, strings.ToUpper(usage.HumanAge(sn.Oldest))))
 	}
 	for _, warning := range warnings {
 		b.WriteString("\n\nWARNING: ")
@@ -471,14 +705,21 @@ func displayConfigValue(v string) string {
 	return v
 }
 
-func renderAccountRow(slot int, email string, u usage.AccountUsage, stateLabel string) string {
+func renderAccountRow(slot int, email string, u usage.AccountUsage, stateLabel string, stale bool) string {
+	five, seven, reset := usageBlock(u.FiveHour), usageBlock(u.SevenDay), resetForAccount(u)
+	if stale {
+		// This is the surface the reporter of issue #46 was reading while the
+		// cache sat twelve days old, so it is the one that most needs to stop
+		// printing percentages it cannot stand behind.
+		five, seven, reset = "?", "?", "?"
+	}
 	line := fmt.Sprintf("│ %-4s │ %-25s │ %-6s │ %-20s │ %-20s │ %-6s │\n",
 		fmt.Sprintf("%02d", slot),
 		clipDisplay(email, 25),
 		clipDisplay(strings.ToUpper(stateLabel), 6),
-		usageBlock(u.FiveHour),
-		usageBlock(u.SevenDay),
-		clipDisplay(resetForAccount(u), 6),
+		five,
+		seven,
+		clipDisplay(reset, 6),
 	)
 	if u.TokenExpired {
 		line += fmt.Sprintf("│ %-96s │\n", "TOKEN EXPIRED: RE-LOGIN AND RUN /anthropool:add")
@@ -576,22 +817,30 @@ func capacityLabel(u usage.AccountUsage, thresholds usage.Thresholds) string {
 	return "usable"
 }
 
-func nextUsableSlot(state *store.State, cache usage.Cache, thresholds usage.Thresholds) (slot int, email, reset string, ok bool) {
+// nextUsableSlot names the account to move to next. It is advisory text, not
+// the swap decision itself, but naming a candidate off a reading days out of
+// date is how issue #46 came to recommend a cancelled account — so a stale
+// entry disqualifies a slot from being suggested. Recommending nothing is a
+// worse experience and a better answer.
+func nextUsableSlot(state *store.State, cache usage.Cache, thresholds usage.Thresholds, now time.Time) (slot int, email, reset string, ok bool) {
 	slots := state.SortedSlots()
 	sort.Ints(slots)
 	for _, s := range slots {
 		acct := state.Accounts[s]
-		if !accountHasPromptCapacity(cache, acct.Email, thresholds) {
+		if !accountHasPromptCapacity(cache, acct, thresholds) {
 			continue
 		}
-		u := cache[acct.Email]
+		u, _ := cachedUsage(cache, acct.CacheKey(), acct.Email)
+		if u.StaleReading(now) {
+			continue
+		}
 		return s, acct.Email, resetForWindow(u.FiveHour), true
 	}
 	return 0, "", "", false
 }
 
-func accountHasPromptCapacity(cache usage.Cache, email string, thresholds usage.Thresholds) bool {
-	u, ok := cache[email]
+func accountHasPromptCapacity(cache usage.Cache, acct store.Account, thresholds usage.Thresholds) bool {
+	u, ok := cachedUsage(cache, acct.CacheKey(), acct.Email)
 	if !ok {
 		return true
 	}
@@ -599,17 +848,7 @@ func accountHasPromptCapacity(cache usage.Cache, email string, thresholds usage.
 }
 
 func usageHasPromptCapacity(u usage.AccountUsage, thresholds usage.Thresholds) bool {
-	if u.TokenExpired {
-		return false
-	}
-	if u.SevenDay != nil && u.SevenDay.Utilization >= 100 {
-		return false
-	}
-	cap5 := thresholds.FiveHour
-	if cap5 == 0 || cap5 == 100 {
-		cap5 = 90
-	}
-	return u.FiveHour == nil || u.FiveHour.Utilization < float64(cap5)
+	return usage.HasSwitchCapacity(u, thresholds, time.Now())
 }
 
 func nextResetSlot(state *store.State, cache usage.Cache) (slot int, email, reset string, ok bool) {
@@ -620,7 +859,7 @@ func nextResetSlot(state *store.State, cache usage.Cache) (slot int, email, rese
 	sort.Ints(slots)
 	for _, s := range slots {
 		acct := state.Accounts[s]
-		u := cache[acct.Email]
+		u, _ := cachedUsage(cache, acct.CacheKey(), acct.Email)
 		if u.FiveHour == nil || u.FiveHour.ResetsAt == nil {
 			continue
 		}
@@ -727,7 +966,7 @@ func Stop(stdin io.Reader) error {
 // SessionStart is `anthropool hook session-start`. We capture the session ID
 // the moment a session begins so the wrapper does not have to fall
 // back to mtime-scanning the transcript directory.
-func SessionStart(stdin io.Reader) error {
+func SessionStart(stdin io.Reader, stdout io.Writer) error {
 	if !isWrapped() {
 		return nil
 	}
@@ -743,25 +982,52 @@ func SessionStart(stdin io.Reader) error {
 		// fallback, but this case is rare.
 		return nil
 	}
-	return signals.Write(pid, signals.SessionStarted, signals.SessionStartedPayload{
+	if err := signals.Write(pid, signals.SessionStarted, signals.SessionStartedPayload{
 		SessionID: in.SessionID,
 		CWD:       in.CWD,
 		Source:    in.Source,
 		Timestamp: time.Now().UTC(),
-	})
+	}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(in.Source) == "resume" {
+		writeSessionStartUsageContext(stdout)
+	}
+	return nil
 }
 
-// RateLimit is `anthropool hook rate-limit`. Claude Code routes generic
-// PostToolUseFailure events through this; we filter only the "error"
-// field for rate-limit indicators before signalling.
+func writeSessionStartUsageContext(stdout io.Writer) {
+	text, err := renderPromptUsage(false)
+	if err != nil || !strings.Contains(text, "STATUS : ALL MANAGED ACCOUNTS EXHAUSTED") {
+		return
+	}
+	msg := "ANTHROPOOL account status at session resume:\n\n" + text +
+		"\n\nAll managed accounts are currently exhausted. You can still read this chat, but new Claude work will wait until the next reset or another account is added."
+	out, _ := json.Marshal(sessionStartHookOutput{
+		HookSpecificOutput: sessionStartSpecificOutput{
+			HookEventName:     "SessionStart",
+			AdditionalContext: msg,
+		},
+	})
+	_, _ = stdout.Write(append(out, '\n'))
+}
+
+// RateLimit is `anthropool hook rate-limit`. Claude Code routes every
+// StopFailure and PostToolUseFailure through here; classifyFailure /
+// classifyRateLimit decide whether the payload is a genuine account-level
+// rate/usage cap (→ swap) or a retryable API failure (→ backoff), and drop
+// everything else. Because a swap restarts the wrapped process, that
+// decision is deliberately conservative — see classifyRateLimit for the
+// ordered guards: foreign-content and denylist rejects first, then strong
+// natural-language cap phrasings on any event, and technical tokens
+// (429, rate_limit_error) only on a turn-level StopFailure. In particular
+// a single PostToolUseFailure accepts strong prose only, so a failed
+// tool's stderr or a fetched web page can't rotate the seat (#39).
 //
-// We intentionally search only the error field — not tool_input or
-// the full payload — to avoid false positives when Claude generates or
-// executes code that happens to contain "rate_limit" as a variable
-// name or string literal.
-//
-// The "error" field can be a JSON string or a JSON object depending on
-// the Claude Code version; we extract its text from either shape.
+// Only the structured "error"/"error_details" fields and
+// last_assistant_message are searched — never tool_input or the full
+// payload — and each field may be a JSON string or object, which
+// extractErrorText normalises.
 func RateLimit(stdin io.Reader) error {
 	if !isWrapped() {
 		return nil
@@ -776,32 +1042,210 @@ func RateLimit(stdin io.Reader) error {
 		return nil
 	}
 
-	// Extract the error text from either JSON shape.
-	// Shape A — string:  "error": "rate limit exceeded"
-	// Shape B — object:  "error": {"type": "rate_limit_error", "message": "..."}
+	kind, message := classifyFailure(in)
+	switch kind {
+	case signals.RateLimited:
+		return signals.Write(pid, signals.RateLimited, signals.RateLimitedPayload{
+			Timestamp: time.Now().UTC(),
+			Message:   message,
+		})
+	case signals.TurnFailed:
+		return signals.Write(pid, signals.TurnFailed, signals.TurnFailedPayload{
+			Timestamp: time.Now().UTC(),
+			Message:   message,
+		})
+	}
+	return nil
+}
+
+// classifyFailure decides which signal (if any) a failure event should
+// produce, and the message to attach.
+//
+// Extracts the error text from either JSON shape. StopFailure sends
+// error="rate_limit" with optional error_details and last_assistant_message;
+// PostToolUseFailure has historically put the useful text in error itself.
+// Shape A — string:  "error": "rate limit exceeded"
+// Shape B — object:  "error": {"type": "rate_limit_error", "message": "..."}
+func classifyFailure(in rateLimitHookInput) (signals.Name, string) {
 	errText := extractErrorText(in.Error)
-	if errText == "" {
-		return nil
+	detailText := extractErrorText(in.ErrorDetails)
+	assistantText := extractErrorText(in.LastAssistantMessage)
+	combined := strings.Join(nonEmpty(errText, detailText, assistantText), "\n")
+	if combined == "" {
+		return "", ""
 	}
 
-	lower := strings.ToLower(errText)
-	isRateLimit := strings.Contains(lower, "rate_limit") ||
-		strings.Contains(lower, "rate limit") ||
-		strings.Contains(lower, "usage limit") ||
-		strings.Contains(lower, "overloaded_error")
-	if !isRateLimit {
-		return nil
+	lower := strings.ToLower(combined)
+	if name, message := classifyRateLimit(in, lower, errText, detailText, assistantText); name != "" {
+		return name, message
 	}
 
-	return signals.Write(pid, signals.RateLimited, signals.RateLimitedPayload{
-		Timestamp: time.Now().UTC(),
-		Message:   errText,
-	})
+	// Non-rate-limit API failure. Two extra guards beyond the rate-limit
+	// path, because the failure patterns here (timeout, connection, 5xx)
+	// are words that legitimately appear all over normal conversations:
+	//
+	//   - Only StopFailure qualifies: it means the whole turn died after
+	//     Claude Code exhausted its own retries. PostToolUseFailure
+	//     routes through here too, but a tool's stderr saying
+	//     "connection timed out" is the tool's problem, not the API's.
+	//   - Only the structured error fields are searched — never
+	//     last_assistant_message. Claude discussing a timeout bug must
+	//     not read as the API timing out.
+	structuredErr := strings.ToLower(strings.Join(nonEmpty(errText, detailText), "\n"))
+	if in.HookEventName == "StopFailure" && isAPIFailure(structuredErr) {
+		failMsg := detailText
+		if failMsg == "" {
+			failMsg = errText
+		}
+		return signals.TurnFailed, failMsg
+	}
+	return "", ""
+}
+
+// apiStatusCode matches 5xx status codes as standalone tokens so a
+// number embedded in unrelated text ("215000 tokens") never counts.
+var apiStatusCode = regexp.MustCompile(`\b(500|502|503|504|529)\b`)
+
+// classifyRateLimit decides whether a failure payload is a genuine
+// account-level rate/usage limit that warrants a seat swap. A swap
+// restarts the wrapped Claude Code process (killing in-flight work), so
+// a false positive is destructive — this classifier is deliberately
+// conservative. Issue #39: v0.3.3 broadened the match to a bare
+// "limit reached", which then fired on "concurrent subagent limit
+// reached" (a Claude Code refusal, not a cap) and on fetched web pages
+// that merely document their own "rate limits". Both restarted healthy
+// accounts and one killed 20 running subagents.
+//
+// lower is the lower-cased join of all populated fields; the raw field
+// texts are passed through so the swap-history message stays readable.
+func classifyRateLimit(in rateLimitHookInput, lower, errText, detailText, assistantText string) (signals.Name, string) {
+	// Guard 1 — foreign content, checked before any signal. A genuine
+	// Anthropic rate-limit error is a short structured message; it is
+	// never a captured web page. When the payload carries a tool's fetched
+	// document — WebFetch prefixes a "URL: <link>" header, HTML starts
+	// with a doctype/tag — nothing inside it can be trusted as an API
+	// signal, not even a strong one (a docs page may literally read
+	// "usage limits"). Structural markers only: bare links appear in
+	// legitimate cap messages (upgrade / console URLs) and must not
+	// disqualify.
+	for _, marker := range []string{"url: http", "<!doctype", "<html", "<head", "<body"} {
+		if strings.Contains(lower, marker) {
+			return "", ""
+		}
+	}
+
+	// Guard 2 — denylist. These name a *different* limit than the account
+	// cap, or explicitly declare the condition non-retryable. They must
+	// never swap even though the word "limit" appears.
+	for _, deny := range []string{
+		"do not retry",
+		"concurrent subagent", "concurrent_subagents", "max_concurrent_subagents",
+		"context window", "context length", "maximum context",
+		"token limit", "output limit", "output token", "max tokens",
+		"character limit", "file size", "recursion limit",
+	} {
+		if strings.Contains(lower, deny) {
+			return "", ""
+		}
+	}
+
+	message := assistantText
+	if message == "" {
+		message = detailText
+	}
+	if message == "" {
+		message = errText
+	}
+
+	// Strong signals — natural-language account/usage-cap phrasings that
+	// do not occur incidentally in tool output or code. Trusted on any
+	// event: a real cap can surface through a tool call as well as a turn.
+	for _, s := range []string{
+		"usage limit",
+		"session limit",
+		"hit your limit", "reached your limit",
+		"weekly limit", "limit will reset",
+		"upgrade to increase your usage",
+	} {
+		if strings.Contains(lower, s) {
+			return signals.RateLimited, message
+		}
+	}
+
+	// The remaining signals are technical tokens that can legitimately
+	// appear in a failed tool's own output (another service's 429, a
+	// linter flagging a `rate_limit` identifier). Restrict them to a
+	// turn-level StopFailure — the whole turn dying after Claude Code
+	// exhausted its retries — never a single PostToolUseFailure.
+	if in.HookEventName != "StopFailure" {
+		return "", ""
+	}
+	// Anthropic API error types are unambiguous on a StopFailure.
+	for _, s := range []string{"rate_limit_error", "rate_limit", "overloaded_error"} {
+		if strings.Contains(lower, s) {
+			return signals.RateLimited, message
+		}
+	}
+	// Generic phrasings still need an API/Anthropic context token nearby,
+	// so a turn that merely discusses "rate limit" or fails for an
+	// unrelated reason does not rotate the seat.
+	generic := false
+	for _, s := range []string{"429", "too many requests", "quota exceeded", "rate limit"} {
+		if strings.Contains(lower, s) {
+			generic = true
+			break
+		}
+	}
+	if generic {
+		for _, ctx := range []string{"api", "anthropic", "claude", "http", "status", "response", "overloaded", "retry-after", "retry after"} {
+			if strings.Contains(lower, ctx) {
+				return signals.RateLimited, message
+			}
+		}
+	}
+	return "", ""
+}
+
+// isAPIFailure reports whether an error string from StopFailure looks
+// like a transport- or server-side API failure worth retrying, as
+// opposed to something the user did (abort) or a model refusal.
+func isAPIFailure(lower string) bool {
+	for _, pat := range []string{
+		"api_error",
+		"api error",
+		"internal server error",
+		"internal_server_error",
+		"service unavailable",
+		"bad gateway",
+		"gateway timeout",
+		"connection error",
+		"connection refused",
+		"connection reset",
+		"connection closed",
+		"econnrefused",
+		"econnreset",
+		"etimedout",
+		"enotfound",
+		"eai_again",
+		"timed out",
+		"timeout",
+		"network error",
+		"fetch failed",
+		"socket hang up",
+	} {
+		if strings.Contains(lower, pat) {
+			return true
+		}
+	}
+	return apiStatusCode.MatchString(lower)
 }
 
 // extractErrorText returns a plain string from a json.RawMessage that
 // is either a JSON string or a JSON object with "type"/"message" fields.
 func extractErrorText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
 	// Try string shape first.
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
@@ -819,6 +1263,33 @@ func extractErrorText(raw json.RawMessage) string {
 		return obj.Type
 	}
 	return ""
+}
+
+func nonEmpty(values ...string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func cachedUsage(cache usage.Cache, cacheKey, email string) (usage.AccountUsage, bool) {
+	if cache == nil {
+		return usage.AccountUsage{}, false
+	}
+	if cacheKey != "" {
+		if u, ok := cache[cacheKey]; ok {
+			return u, true
+		}
+	}
+	if email != "" {
+		if u, ok := cache[email]; ok {
+			return u, true
+		}
+	}
+	return usage.AccountUsage{}, false
 }
 
 // decode reads stdin (with a deadline) and parses it as JSON. Empty

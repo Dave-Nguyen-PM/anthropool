@@ -6,8 +6,9 @@ allowed-tools: Bash(anthropool __slash-switch:*)
 
 # /anthropool:switch
 
-Switches the active anthropool-managed account. With no argument, rotates to
-the next account.
+Switches the active anthropool-managed account in place — the conversation
+continues on the new account with no restart. With no argument, rotates
+to the next account.
 
 ```bash
 anthropool __slash-switch $ARGUMENTS

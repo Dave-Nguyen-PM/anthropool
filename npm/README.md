@@ -1,4 +1,4 @@
-# /anthropool
+# @Dave-Nguyen-PM/anthropool
 
 Multi-account switcher for Claude Code with hook-driven auto-resume.
 
@@ -9,7 +9,7 @@ x64/arm64, Windows x64) from the
 and exposes it as the `anthropool` command on your `PATH`.
 
 ```bash
-npm install -g /anthropool
+npm install -g @Dave-Nguyen-PM/anthropool
 anthropool setup
 anthropool add        # or /anthropool:add inside Claude while logged in
 ```
@@ -47,8 +47,8 @@ swaps, strategies, history, configuration), see the main repository:
 
 Override the source repo with `ANTHROPOOL_RELEASE_REPO=<owner>/<repo>` if you
 maintain a fork. To skip the network entirely, install with
-`npm install -g /anthropool --ignore-scripts` and drop the binary at
-`node_modules//anthropool/bin/anthropool` (or `anthropool.exe` on Windows) yourself.
+`npm install -g @Dave-Nguyen-PM/anthropool --ignore-scripts` and drop the binary at
+`node_modules/@Dave-Nguyen-PM/anthropool/bin/anthropool` (or `anthropool.exe` on Windows) yourself.
 
 ## Troubleshooting
 
@@ -67,7 +67,7 @@ Open a new terminal window after saving. Full instructions: https://anthropool.d
 **Postinstall failed to download the binary**
 
 ```bash
-npm install -g /anthropool --force
+npm install -g @Dave-Nguyen-PM/anthropool --force
 ```
 
 If you are behind a corporate proxy, set `HTTPS_PROXY` first. Or download the binary directly from the [releases page](https://github.com/Dave-Nguyen-PM/anthropool/releases/latest) and drop it at the path shown in the error.

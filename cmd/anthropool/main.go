@@ -29,58 +29,39 @@ import (
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/branding"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/config"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/creds"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/history"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/hookinstall"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/hooks"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/lockfile"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/monitor"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/paths"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/registry"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/store"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/supportnotice"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/switcher"
+	"github.com/Dave-Nguyen-PM/anthropool/internal/transcripts"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/updater"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/usage"
 	"github.com/Dave-Nguyen-PM/anthropool/internal/wrapper"
 	"golang.org/x/term"
 )
 
+// version is overridden at build time by the release workflow via:
+//
+//	-ldflags "-X main.version=X.Y.Z"
+//
+// It must be a var (not const) so -ldflags can inject the real release
+// tag. The fallback "1.0.1" is the development/unreleased default;
+// released binaries always get the tag stamped in.
+var version = "1.0.1"
+
 const (
-	version = "0.2.5"
 	// donateURL is shown only by `anthropool version --verbose`. Subtle by
 	// design — never printed during normal use, never injected into
 	// help output, never shown by the wrapper or the slash command.
 	donateURL = "https://support.dave.com"
 )
-
-// knownSubcommands is the set of first-args anthropool handles itself.
-// Anything else (including `--resume`, `mcp`, `-c`, etc.) is forwarded
-// to the real claude binary via the wrapper.
-var knownSubcommands = map[string]bool{
-	"add":             true,
-	"list":            true,
-	"ls":              true,
-	"remove":          true,
-	"rm":              true,
-	"status":          true,
-	"support":         true,
-	"switch":          true,
-	"force-switch":    true,
-	"rescue-switch":   true,
-	"setup":           true,
-	"install-hooks":   true,
-	"uninstall-hooks": true,
-	"hook":            true,
-	"history":         true,
-	"config":          true,
-	"usage":           true,
-	"upgrade":         true,
-	"run":             true,
-	"docs":            true,
-	"help":            true,
-	"--help":          true,
-	"-h":              true,
-	"version":         true,
-	"--version":       true,
-	"__slash-switch":  true,
-}
 
 func main() {
 	initTerminalOutput()
@@ -93,52 +74,11 @@ func main() {
 	cmd := os.Args[1]
 	rest := os.Args[2:]
 
-	if !knownSubcommands[cmd] {
+	// The table in commands.go decides both what anthropool claims and where it
+	// goes, so the two cannot drift apart: a command that dispatches is
+	// exactly one anthropool does not forward to claude.
+	if !dispatch(cmd, rest) {
 		runWrapper(os.Args[1:])
-		return
-	}
-
-	switch cmd {
-	case "add":
-		cmdAdd(rest)
-	case "list", "ls":
-		cmdList(rest)
-	case "remove", "rm":
-		cmdRemove(rest)
-	case "status":
-		cmdStatus(rest)
-	case "support":
-		cmdSupport(rest)
-	case "switch":
-		cmdSwitch(rest)
-	case "force-switch", "rescue-switch":
-		cmdForceSwitch(rest)
-	case "setup":
-		cmdSetup(rest)
-	case "install-hooks":
-		cmdInstallHooks(rest)
-	case "uninstall-hooks":
-		cmdUninstallHooks(rest)
-	case "hook":
-		cmdHook(rest)
-	case "history":
-		cmdHistory(rest)
-	case "config":
-		cmdConfig(rest)
-	case "usage":
-		cmdUsage(rest)
-	case "upgrade":
-		cmdUpgrade(rest)
-	case "run":
-		runWrapper(rest)
-	case "docs":
-		cmdDocs(rest)
-	case "help", "--help", "-h":
-		printHelp()
-	case "version", "--version":
-		cmdVersion(rest)
-	case "__slash-switch":
-		cmdSlashSwitch(rest)
 	}
 }
 
@@ -147,16 +87,23 @@ func main() {
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	slot := fs.Int("slot", 0, "specific slot number (default: next free)")
+	alias := fs.String("alias", "", "short alias for this account (e.g. work, personal)")
+	noAlias := fs.Bool("no-alias", false, "skip auto-alias from display name")
+	force := fs.Bool("force", false, "capture even if the stored token looks like another account's")
 	_ = fs.Parse(args)
 
-	acct, refreshed, err := switcher.AddCurrent(*slot)
+	acct, refreshed, err := switcher.AddCurrent(*slot, *alias, *noAlias, *force)
 	if err != nil {
 		fail(err)
 	}
+	aliasStr := ""
+	if acct.Alias != "" {
+		aliasStr = fmt.Sprintf(" · %s", acct.Alias)
+	}
 	if refreshed {
-		fmt.Printf("Refreshed slot %d (%s).\n", acct.Slot, acct.Email)
+		fmt.Printf("Refreshed slot %d (%s%s).\n", acct.Slot, acct.Email, aliasStr)
 	} else {
-		fmt.Printf("Added slot %d (%s).\n", acct.Slot, acct.Email)
+		fmt.Printf("Added slot %d (%s%s).\n", acct.Slot, acct.Email, aliasStr)
 	}
 }
 
@@ -196,6 +143,76 @@ func cmdList(args []string) {
 	if !*refresh && len(cache) == 0 {
 		fmt.Printf("\n %s(No usage data — run `anthropool list --refresh` or `anthropool usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
 	}
+}
+
+func cmdProjectStats(args []string) {
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("project stats", flag.ExitOnError)
+	days := fs.Int("days", 0, "limit to the last N days (0 = all time)")
+	_ = fs.Parse(args[1:])
+
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	proj, ok := state.Projects[name]
+	if !ok {
+		fail(fmt.Errorf("project %q not found — see `anthropool project list`", name))
+	}
+	var since time.Time
+	if *days > 0 {
+		since = time.Now().Add(-time.Duration(*days) * 24 * time.Hour)
+	}
+	st, err := transcripts.ForDir(proj.Dir, since)
+	if err != nil {
+		fail(err)
+	}
+
+	window := "all time"
+	if *days > 0 {
+		window = fmt.Sprintf("last %d day(s)", *days)
+	}
+	fmt.Printf("%s  %s  (%s)\n", proj.Name, proj.Dir, window)
+	if st.Sessions == 0 {
+		fmt.Println("  no transcript activity found")
+		return
+	}
+	fmt.Printf("  sessions      %d\n", st.Sessions)
+	fmt.Printf("  active time   %s\n", formatDuration(st.ActiveTime))
+	fmt.Printf("  turns         %d\n", st.Turns)
+	fmt.Printf("  tokens in     %s\n", formatTokens(st.InputTokens))
+	fmt.Printf("  tokens out    %s\n", formatTokens(st.OutputTokens))
+	fmt.Printf("  cache write   %s\n", formatTokens(st.CacheCreationTokens))
+	fmt.Printf("  cache read    %s\n", formatTokens(st.CacheReadTokens))
+	fmt.Printf("  first / last  %s → %s\n",
+		st.FirstAt.Local().Format("2006-01-02 15:04"),
+		st.LastAt.Local().Format("2006-01-02 15:04"))
+}
+
+func formatTokens(n int64) string {
+	switch {
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB", float64(n)/1e9)
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1e3)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Minute)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dh %02dm", h, m)
+	}
+	return fmt.Sprintf("%dm", m)
 }
 
 func windowPct(w *usage.Window) string {
@@ -240,7 +257,7 @@ func cmdRemove(args []string) {
 	force := fs.Bool("force", false, "remove even if active")
 	_ = fs.Parse(args)
 	if fs.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool remove [--force] <slot|email>")
+		fmt.Fprintln(os.Stderr, "usage: anthropool remove [--force] <slot|email|alias>")
 		os.Exit(2)
 	}
 	acct, err := switcher.Remove(fs.Arg(0), *force)
@@ -250,7 +267,317 @@ func cmdRemove(args []string) {
 	fmt.Printf("Removed slot %d (%s).\n", acct.Slot, acct.Email)
 }
 
+// cmdAlias sets or clears the alias for a managed account.
+//
+//	anthropool alias <slot|email|alias> <new-alias>   — set alias
+//	anthropool alias <slot|email|alias> --clear       — remove alias
+// --- Project subcommands ---------------------------------------------------
+
+func cmdProject(args []string) {
+	if len(args) == 0 {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "create":
+		cmdProjectCreate(rest)
+	case "assign":
+		cmdProjectMutate(rest, true)
+	case "unassign":
+		cmdProjectMutate(rest, false)
+	case "list", "ls":
+		cmdProjectList(rest)
+	case "stats":
+		cmdProjectStats(rest)
+	case "remove", "rm":
+		cmdProjectRemove(rest)
+	default:
+		printProjectUsage()
+		os.Exit(2)
+	}
+}
+
+func printProjectUsage() {
+	fmt.Fprintln(os.Stderr, "usage: anthropool project create <name> [--dir PATH]     bind a directory (default: cwd)")
+	fmt.Fprintln(os.Stderr, "       anthropool project assign <name> <slot|email|alias> [...]")
+	fmt.Fprintln(os.Stderr, "       anthropool project unassign <name> <slot|email|alias> [...]")
+	fmt.Fprintln(os.Stderr, "       anthropool project list [--refresh]")
+	fmt.Fprintln(os.Stderr, "       anthropool project stats <name> [--days N]      tokens & time from Claude Code transcripts")
+	fmt.Fprintln(os.Stderr, "       anthropool project remove <name>")
+}
+
+func withState(fn func(*store.State) error) {
+	lk, err := lockfile.Acquire(paths.LockFile(), 10*time.Second)
+	if err != nil {
+		fail(err)
+	}
+	defer lk.Unlock() //nolint:errcheck
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	if err := fn(state); err != nil {
+		fail(err)
+	}
+	if err := state.Save(); err != nil {
+		fail(err)
+	}
+}
+
+func cmdProjectCreate(args []string) {
+	// Name first, flags after: `anthropool project create iht --dir ~/code/iht`.
+	// Go's flag parser stops at the first positional, so split by hand.
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("project create", flag.ExitOnError)
+	dir := fs.String("dir", "", "directory the project claims (default: current directory)")
+	_ = fs.Parse(args[1:])
+	if fs.NArg() != 0 {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	d := *dir
+	if d == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fail(err)
+		}
+		d = cwd
+	}
+	abs, err := filepath.Abs(d)
+	if err != nil {
+		fail(err)
+	}
+	withState(func(state *store.State) error {
+		return state.AddProject(name, abs)
+	})
+	fmt.Printf("Created project %s → %s. Assign seats with `anthropool project assign %s <slot|alias>`.\n", name, abs, name)
+}
+
+func cmdProjectMutate(args []string, assign bool) {
+	if len(args) < 2 {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	name, seats := args[0], args[1:]
+	withState(func(state *store.State) error {
+		for _, seat := range seats {
+			acct, err := state.Resolve(seat)
+			if err != nil {
+				return err
+			}
+			if assign {
+				if err := state.AssignProjectSlot(name, acct.Slot); err != nil {
+					return err
+				}
+				fmt.Printf("Assigned slot %d (%s) to %s.\n", acct.Slot, acct.Email, name)
+			} else {
+				if err := state.UnassignProjectSlot(name, acct.Slot); err != nil {
+					return err
+				}
+				fmt.Printf("Unassigned slot %d (%s) from %s.\n", acct.Slot, acct.Email, name)
+			}
+		}
+		return nil
+	})
+}
+
+func cmdProjectRemove(args []string) {
+	if len(args) != 1 {
+		printProjectUsage()
+		os.Exit(2)
+	}
+	withState(func(state *store.State) error {
+		return state.RemoveProject(args[0])
+	})
+	fmt.Printf("Removed project %s. Accounts are untouched.\n", args[0])
+}
+
+func cmdProjectList(args []string) {
+	fs := flag.NewFlagSet("project list", flag.ExitOnError)
+	refresh := fs.Bool("refresh", false, "fetch fresh usage before printing")
+	_ = fs.Parse(args)
+
+	if *refresh {
+		if _, errs := monitor.RefreshAll(); len(errs) > 0 {
+			for _, e := range errs {
+				fmt.Fprintf(os.Stderr, "warning: %v\n", e)
+			}
+		}
+	}
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	if len(state.Projects) == 0 {
+		fmt.Println("No projects defined. Create one with `anthropool project create <name> [--dir PATH]`.")
+		return
+	}
+	cache, _ := usage.LoadCache()
+
+	names := make([]string, 0, len(state.Projects))
+	for n := range state.Projects {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		p := state.Projects[n]
+		fmt.Printf("%s  %s\n", p.Name, p.Dir)
+		if len(p.Slots) == 0 {
+			fmt.Println("  (no seats assigned — full pool applies here)")
+			continue
+		}
+		for _, slot := range p.Slots {
+			acct, ok := state.Accounts[slot]
+			if !ok {
+				continue
+			}
+			label := acct.Email
+			if acct.Alias != "" {
+				label = acct.Alias + " · " + acct.Email
+			}
+			line := fmt.Sprintf("  [%02d] %-42s", slot, label)
+			if cache != nil {
+				if u, ok := cache[acct.CacheKey()]; ok {
+					line += "  5h:" + windowPct(u.FiveHour) + "  7d:" + windowPct(u.SevenDay)
+					if u.TokenExpired {
+						line += "  (needs login)"
+					}
+				} else {
+					line += "  (no usage data — try --refresh)"
+				}
+			}
+			fmt.Println(line)
+		}
+	}
+}
+
+func cmdAlias(args []string) {
+	fs := flag.NewFlagSet("alias", flag.ExitOnError)
+	clear := fs.Bool("clear", false, "remove the alias from this account")
+	_ = fs.Parse(args)
+
+	if fs.NArg() < 1 || (fs.NArg() < 2 && !*clear) {
+		fmt.Fprintln(os.Stderr, "usage: anthropool alias <slot|email|alias> <new-alias>")
+		fmt.Fprintln(os.Stderr, "       anthropool alias <slot|email|alias> --clear")
+		os.Exit(2)
+	}
+
+	lk, err := lockfile.Acquire(paths.LockFile(), 10*time.Second)
+	if err != nil {
+		fail(err)
+	}
+	defer lk.Unlock() //nolint:errcheck
+
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	acct, err := state.Resolve(fs.Arg(0))
+	if err != nil {
+		fail(err)
+	}
+
+	newAlias := ""
+	if !*clear {
+		newAlias = strings.TrimSpace(fs.Arg(1))
+	}
+	if err := state.SetAlias(acct.Slot, newAlias); err != nil {
+		fail(err)
+	}
+	if err := state.Save(); err != nil {
+		fail(err)
+	}
+
+	if newAlias == "" {
+		fmt.Printf("Cleared alias for slot %d (%s).\n", acct.Slot, acct.Email)
+	} else {
+		fmt.Printf("Set alias %q for slot %d (%s).\n", newAlias, acct.Slot, acct.Email)
+	}
+}
+
+// cmdSessions lists every live anthropool wrapper on this machine from the
+// heartbeat registry: which directory, which seat, what state. This is
+// the first place N concurrent sessions become visible at all —
+// `anthropool list` shows seats, this shows the sessions using them.
+func cmdSessions(args []string) {
+	_ = args
+	entries := registry.List()
+	recent := registry.RecentSessions()
+	if len(entries) == 0 && len(recent) == 0 {
+		fmt.Println("No anthropool sessions are running.")
+		return
+	}
+	now := time.Now()
+	if len(entries) == 0 {
+		fmt.Println("No anthropool sessions are running.")
+	}
+	for _, e := range entries {
+		state := e.State
+		if e.Detail != "" {
+			state += " (" + e.Detail + ")"
+		}
+		sid := e.SessionID
+		if len(sid) > 8 {
+			sid = sid[:8]
+		}
+		if sid == "" {
+			sid = "-"
+		}
+		name := transcripts.FirstPrompt(e.CWD, e.SessionID, 60)
+		if name == "" {
+			name = filepath.Base(e.CWD)
+		}
+		fmt.Printf("[%d] %s\n", e.PID, name)
+		fmt.Printf("    %s\n", e.CWD)
+		fmt.Printf("    seat %-28s session %-9s %s\n", e.Seat, sid, state)
+		fmt.Printf("    up %s, last change %s ago\n",
+			formatDuration(now.Sub(e.StartedAt)), formatDuration(now.Sub(e.UpdatedAt)))
+	}
+	printRecentSessions(recent, now)
+}
+
+// printRecentSessions lists conversations whose wrapper has exited, with
+// the command that reopens each one. Claude Code shows a session ID only
+// in its running UI, so once a session ends the ID exists nowhere the user
+// can reach — and a session that ended badly took the scrollback with it
+// (issue #48). This is the way back.
+func printRecentSessions(recent []registry.Recent, now time.Time) {
+	if len(recent) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Recently ended:")
+	for _, r := range recent {
+		name := transcripts.FirstPrompt(r.CWD, r.SessionID, 60)
+		if name == "" {
+			name = filepath.Base(r.CWD)
+		}
+		fmt.Printf("  %s\n", name)
+		fmt.Printf("    %s", r.CWD)
+		if r.Seat != "" {
+			fmt.Printf("  ·  seat %s", r.Seat)
+		}
+		// Clamp: a record written on a machine whose clock later moved
+		// back would otherwise read "ended -44m ago".
+		age := now.Sub(r.EndedAt)
+		if age < 0 {
+			age = 0
+		}
+		fmt.Printf("  ·  ended %s ago\n", formatDuration(age))
+		fmt.Printf("    anthropool --resume %s\n", r.SessionID)
+	}
+}
+
 func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	noRefresh := fs.Bool("no-refresh", false, "show cached usage without fetching fresh data")
+	_ = fs.Parse(args)
+
 	cfg, _ := config.Load()
 	setTheme(cfg.Theme)
 
@@ -261,6 +588,11 @@ func cmdStatus(args []string) {
 	liveEmail, liveErr := switcher.CurrentLiveEmail()
 	if liveErr != nil {
 		liveEmail = ""
+	}
+
+	var warnings []error
+	if !*noRefresh && len(state.Accounts) > 0 {
+		_, warnings = monitor.RefreshAll()
 	}
 
 	cache, _ := usage.LoadCache()
@@ -274,24 +606,112 @@ func cmdStatus(args []string) {
 		if len(cache) == 0 {
 			fmt.Printf("\n %s(No usage data — run `anthropool usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
 		}
+		printCredentialHealth(os.Stdout, state)
+		printSharedTokenWarning(os.Stdout, state)
 	} else {
 		fmt.Printf(" %sNo accounts managed yet. Run `anthropool add` while logged in.%s\n\n", colorGray, colorReset)
 	}
+	for _, e := range warnings {
+		fmt.Fprintln(os.Stderr, "warning:", e)
+	}
+}
+
+// printCredentialHealth reports slots whose stored login cannot be used.
+//
+// It answers the question that went unanswered while a reporter's pool sat
+// broken for twelve days: the usage numbers had stopped moving and no swap
+// would fire, but nothing said the credential store had emptied out
+// (issue #46). Every other symptom of that is indirect, so this reads the
+// slots and says so plainly, with the repair.
+//
+// Lives on `anthropool status` rather than `anthropool list` on purpose. On macOS and
+// Windows each read hits the OS keystore, and `anthropool list` is run often
+// enough — including by other tools — that adding N keystore reads to it
+// would be a real cost. `anthropool status` is where someone goes to ask what is
+// wrong.
+func printCredentialHealth(w io.Writer, st *store.State) {
+	type problem struct {
+		slot  int
+		email string
+		state creds.BackupState
+	}
+	var problems []problem
+	for _, slot := range st.SortedSlots() {
+		acct := st.Accounts[slot]
+		if bs, _ := creds.CheckBackup(slot, acct.Email); bs != creds.BackupOK {
+			problems = append(problems, problem{slot, acct.Email, bs})
+		}
+	}
+	if len(problems) == 0 {
+		return
+	}
+
+	scope := fmt.Sprintf("%d of %d accounts", len(problems), len(st.Accounts))
+	if len(problems) == len(st.Accounts) {
+		scope = "every account"
+	}
+	fmt.Fprintf(w, " %s⚠ STORED LOGINS UNUSABLE%s — %s. anthropool cannot poll usage for\n", colorYellow, colorReset, scope)
+	fmt.Fprintf(w, " %sthese accounts, and cannot switch to them.%s\n\n", colorGray, colorReset)
+	for _, p := range problems {
+		fmt.Fprintf(w, "   %s[%02d]%s %s — %s%s%s\n",
+			colorGray, p.slot, colorReset, p.email, colorYellow, p.state.Describe(), colorReset)
+	}
+	fmt.Fprintf(w, "\n %sTo repair, for each account above: run `claude login` as that account,%s\n", colorGray, colorReset)
+	fmt.Fprintf(w, " %sthen `anthropool add` to recapture the slot.%s\n\n", colorGray, colorReset)
+}
+
+// printSharedTokenWarning reports slots that hold the same account token as
+// each other.
+//
+// A pool in that state reports one account's usage under two names, so both
+// rows look plausible and neither is right — a threshold swap can move onto
+// an account that is actually exhausted. The write paths now refuse to create
+// it, but a pool captured by an earlier build can already be in it, and
+// nothing else would ever say so.
+func printSharedTokenWarning(w io.Writer, st *store.State) {
+	slots := make([]creds.SlotRef, 0, len(st.Accounts))
+	for _, slot := range st.SortedSlots() {
+		slots = append(slots, creds.SlotRef{Slot: slot, Email: st.Accounts[slot].Email})
+	}
+	groups := creds.SharedTokenSlots(slots)
+	if len(groups) == 0 {
+		return
+	}
+	fmt.Fprintf(w, " %s⚠ SLOTS SHARING ONE LOGIN%s — these slots hold the same account token,\n",
+		colorYellow, colorReset)
+	fmt.Fprintf(w, " %sso their usage figures describe one account under several names.%s\n\n", colorGray, colorReset)
+	for _, group := range groups {
+		var labels []string
+		for _, ref := range group {
+			labels = append(labels, fmt.Sprintf("[%02d] %s", ref.Slot, ref.Email))
+		}
+		fmt.Fprintf(w, "   %s\n", strings.Join(labels, "  =  "))
+	}
+	fmt.Fprintf(w, "\n %sTo repair: run `claude login` as each account in turn, then `anthropool add`.%s\n", colorGray, colorReset)
+	fmt.Fprintf(w, " %sCheck CLAUDE_CONFIG_DIR points where you expect before each one.%s\n\n", colorGray, colorReset)
 }
 
 func cmdSwitch(args []string) {
 	if len(args) != 1 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool switch <slot|email>")
+		fmt.Fprintln(os.Stderr, "usage: anthropool switch <slot|email|alias>")
 		os.Exit(2)
 	}
 	from, to, err := switcher.SwitchTo(args[0])
 	if err != nil {
 		fail(err)
 	}
-	if from.Email != "" {
-		fmt.Printf("Switched %s → %s.\n", from.Email, to.Email)
+	fromLabel := from.Email
+	if from.Alias != "" {
+		fromLabel = from.Alias
+	}
+	toLabel := to.Email
+	if to.Alias != "" {
+		toLabel = to.Alias
+	}
+	if fromLabel != "" {
+		fmt.Printf("Switched %s → %s.\n", fromLabel, toLabel)
 	} else {
-		fmt.Printf("Switched to %s.\n", to.Email)
+		fmt.Printf("Switched to %s.\n", toLabel)
 	}
 	if os.Getenv("ANTHROPOOL_WRAPPED") == "" {
 		fmt.Println("Restart Claude Code to apply the change.")
@@ -308,7 +728,7 @@ func cmdSlashSwitch(args []string) {
 
 func cmdForceSwitch(args []string) {
 	if len(args) > 1 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool force-switch [slot|email]")
+		fmt.Fprintln(os.Stderr, "usage: anthropool force-switch [slot|email|alias]")
 		os.Exit(2)
 	}
 	target := strings.TrimSpace(strings.Join(args, " "))
@@ -319,24 +739,26 @@ func cmdForceSwitch(args []string) {
 
 // --- Hook subcommands ----------------------------------------------------
 
-// cmdHook dispatches `anthropool hook {prompt-submit,stop,session-start,rate-limit}`. These
+// cmdHook dispatches `anthropool hook {prompt-submit|prompt-expansion|stop|session-start|rate-limit}`. These
 // are invoked by Claude Code itself via entries in
 // ~/.claude/settings.json. They read JSON from stdin and write a
 // signal file under the anthropool runtime directory; everything else is
 // done by the wrapper's poll loop.
 func cmdHook(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool hook {prompt-submit|stop|session-start|rate-limit}")
+		fmt.Fprintln(os.Stderr, "usage: anthropool hook {prompt-submit|prompt-expansion|stop|session-start|rate-limit}")
 		os.Exit(2)
 	}
 	var err error
 	switch args[0] {
 	case "prompt-submit":
 		err = hooks.UserPromptSubmit(os.Stdin, os.Stdout)
+	case "prompt-expansion":
+		err = hooks.UserPromptExpansion(os.Stdin, os.Stdout)
 	case "stop":
 		err = hooks.Stop(os.Stdin)
 	case "session-start":
-		err = hooks.SessionStart(os.Stdin)
+		err = hooks.SessionStart(os.Stdin, os.Stdout)
 	case "rate-limit":
 		err = hooks.RateLimit(os.Stdin)
 	default:
@@ -366,7 +788,6 @@ func cmdInstallHooks(args []string) {
 		fmt.Println("All anthropool hooks already installed in ~/.claude/settings.json.")
 	} else {
 		fmt.Printf("Installed/updated hooks in ~/.claude/settings.json: %s\n", strings.Join(changed, ", "))
-		fmt.Println("Restart Claude Code for the new hooks to take effect.")
 	}
 }
 
@@ -419,7 +840,7 @@ func cmdDocs(args []string) {
 
 func renderDocs(useANSI bool) string {
 	var b strings.Builder
-	b.WriteString(":: A N T H R O P O O L   D O C S ::\n\n")
+	b.WriteString(":: C U X   D O C S ::\n\n")
 	b.WriteString("Full documentation:\n")
 	b.WriteString("  https://anthropool.dave.com/docs\n\n")
 	b.WriteString("Topics covered:\n")
@@ -485,74 +906,70 @@ func cmdHistory(args []string) {
 	}
 }
 
-func cmdConfig(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool config show | anthropool config keys | anthropool config edit | anthropool config set <key> <value>")
+func cmdConfigShow(args []string) {
+	c, err := config.Load()
+	if err != nil {
+		fail(err)
+	}
+	out, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		fail(err)
+	}
+	fmt.Println(string(out))
+}
+
+func cmdConfigKeys(args []string) {
+	c, err := config.Load()
+	if err != nil {
+		fail(err)
+	}
+	keys := config.Keys(c)
+	// Compute column widths once so the output lines up.
+	var keyW, curW int
+	for _, k := range keys {
+		if l := len(k.Key); l > keyW {
+			keyW = l
+		}
+		if l := len(k.Current); l > curW {
+			curW = l
+		}
+	}
+	if curW > 30 {
+		curW = 30
+	}
+	fmt.Printf("%-*s  %-*s  %s\n", keyW, "KEY", curW, "CURRENT", "DESCRIPTION (default)")
+	for _, k := range keys {
+		cur := k.Current
+		if len(cur) > curW {
+			cur = cur[:curW-1] + "…"
+		}
+		fmt.Printf("%-*s  %-*s  %s (default: %s)\n", keyW, k.Key, curW, cur, k.Description, k.Default)
+	}
+}
+
+func cmdConfigEdit(args []string) {
+	if err := editConfigInteractive(); err != nil {
+		fail(err)
+	}
+}
+
+func cmdConfigSet(args []string) {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: anthropool config set <key> <value>")
 		os.Exit(2)
 	}
-	switch args[0] {
-	case "show":
-		c, err := config.Load()
-		if err != nil {
-			fail(err)
-		}
-		out, err := json.MarshalIndent(c, "", "  ")
-		if err != nil {
-			fail(err)
-		}
-		fmt.Println(string(out))
-	case "keys":
-		c, err := config.Load()
-		if err != nil {
-			fail(err)
-		}
-		keys := config.Keys(c)
-		// Compute column widths once so the output lines up.
-		var keyW, curW int
-		for _, k := range keys {
-			if l := len(k.Key); l > keyW {
-				keyW = l
-			}
-			if l := len(k.Current); l > curW {
-				curW = l
-			}
-		}
-		if curW > 30 {
-			curW = 30
-		}
-		fmt.Printf("%-*s  %-*s  %s\n", keyW, "KEY", curW, "CURRENT", "DESCRIPTION (default)")
-		for _, k := range keys {
-			cur := k.Current
-			if len(cur) > curW {
-				cur = cur[:curW-1] + "…"
-			}
-			fmt.Printf("%-*s  %-*s  %s (default: %s)\n", keyW, k.Key, curW, cur, k.Description, k.Default)
-		}
-	case "edit":
-		if err := editConfigInteractive(); err != nil {
-			fail(err)
-		}
-	case "set":
-		if len(args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: anthropool config set <key> <value>")
-			os.Exit(2)
-		}
-		c, err := config.Load()
-		if err != nil {
-			fail(err)
-		}
-		c, err = config.Set(c, args[1], args[2])
-		if err != nil {
-			fail(err)
-		}
-		if err := config.Save(c); err != nil {
-			fail(err)
-		}
-		fmt.Printf("Set %s.\n", args[1])
-	default:
-		fmt.Fprintln(os.Stderr, "usage: anthropool config show | anthropool config keys | anthropool config edit | anthropool config set <key> <value>")
-		os.Exit(2)
+	c, err := config.Load()
+	if err != nil {
+		fail(err)
 	}
+	c, err = config.Set(c, args[0], args[1])
+	if err != nil {
+		fail(err)
+	}
+	if err := config.Save(c); err != nil {
+		fail(err)
+	}
+	fmt.Printf("Set %s.\n", args[0])
 }
 
 func editConfigInteractive() error {
@@ -589,7 +1006,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("thresholds.five_hour", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "2":
 			v, ok, err := promptValue(raw, reader, "7d threshold %", strconv.Itoa(c.Thresholds.SevenDay))
@@ -601,7 +1018,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("thresholds.seven_day", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "3":
 			next := map[string]string{"drain": "balanced", "balanced": "manual", "manual": "drain"}[strings.ToLower(c.Strategy.Kind)]
@@ -621,7 +1038,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("strategy.order", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "5":
 			if err := setAndSaveConfig("auto_switch_on_threshold", strconv.FormatBool(!c.AutoSwitchOnThreshold)); err != nil {
@@ -648,7 +1065,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("auto_message", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "9":
 			if err := setAndSaveConfig("update_check.enabled", strconv.FormatBool(!c.UpdateCheck.Enabled)); err != nil {
@@ -664,7 +1081,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("update_check.cadence_hours", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "11":
 			if err := setAndSaveConfig("notify", strconv.FormatBool(!c.Notify)); err != nil {
@@ -678,16 +1095,20 @@ func editConfigInteractive() error {
 			if err := setAndSaveConfig("theme", next); err != nil {
 				return err
 			}
+		case "13":
+			if err := setAndSaveConfig("attach", strconv.FormatBool(!c.Attach)); err != nil {
+				return err
+			}
 		default:
 			fmt.Print("Unknown selection.\r\n")
-			waitEnter(reader)
+			waitEnter(raw, reader)
 		}
 	}
 }
 
 func printConfigEditor(c config.Config) {
 	fmt.Print("\033[H\033[2J")
-	fmt.Printf("%s:: A N T H R O P O O L   S E T T I N G S ::%s\r\n\r\n", colorBold, colorReset)
+	fmt.Printf("%s:: C U X   S E T T I N G S ::%s\r\n\r\n", colorBold, colorReset)
 	fmt.Printf("%sToggle booleans by selecting their number. Numeric/text settings prompt for a value.%s\r\n", colorGray, colorReset)
 	fmt.Printf("%sPress Enter on an empty prompt to go back/cancel. Press Esc or q to exit.%s\r\n\r\n", colorGray, colorReset)
 
@@ -729,6 +1150,7 @@ func printConfigEditor(c config.Config) {
 	row(10, "update cadence", strconv.Itoa(c.UpdateCheck.CadenceHours)+"h", "edit hours", false)
 	row(11, "notifications", checkbox(c.Notify), "toggle", true)
 	row(12, "theme", c.Theme, "cycle default/claude", false)
+	row(13, "attach", checkbox(c.Attach), "toggle", true)
 
 	fmt.Printf("%s└────┴────────────────────────────┴────────────────────────────┴────────────────────────────────────┘%s\r\n\r\n", g, r)
 }
@@ -959,9 +1381,20 @@ func readRawInput(raw *rawMenu, reader *bufio.Reader) (string, bool, error) {
 	}
 }
 
-func waitEnter(reader *bufio.Reader) {
+func waitEnter(raw *rawMenu, reader *bufio.Reader) {
 	fmt.Print("Press Enter to continue...")
-	_, _ = reader.ReadString('\n')
+	if raw == nil || !raw.enabled {
+		_, _ = reader.ReadString('\n')
+		return
+	}
+	// In raw mode Enter sends \r, not \n — ReadString('\n') would block forever.
+	for {
+		b, err := reader.ReadByte()
+		if err != nil || b == '\r' || b == '\n' || b == 0x03 || b == 0x04 {
+			fmt.Print("\r\n")
+			return
+		}
+	}
 }
 
 func checkbox(v bool) string {
@@ -988,33 +1421,46 @@ func clip(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func cmdUsage(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: anthropool usage refresh | anthropool usage show")
-		os.Exit(2)
+func cmdUsageRefresh(args []string) {
+	sweepStart := time.Now().UTC()
+	cache, errs := monitor.RefreshAll()
+	for _, e := range errs {
+		fmt.Fprintln(os.Stderr, "warning:", e)
 	}
-	switch args[0] {
-	case "refresh":
-		_, errs := monitor.RefreshAll()
-		for _, e := range errs {
-			fmt.Fprintln(os.Stderr, "warning:", e)
+	// Re-display so the user sees what was fetched.
+	cmdList(nil)
+	// Exit non-zero when the sweep polled nothing at all, so a cron job
+	// or a wrapper can detect the condition instead of reading a
+	// success it did not get (issue #46).
+	//
+	// The cache answers this directly: an entry stamped at or after the
+	// sweep began is one that came back. Counting errors instead would
+	// misfire, because RefreshAll appends a cache-write failure to the
+	// same slice as the per-account ones — two failed accounts plus a
+	// bad write would look like a total blackout on a pool of two.
+	polled := 0
+	for _, u := range cache {
+		if !u.PolledAt.Before(sweepStart) {
+			polled++
 		}
-		// Re-display so the user sees what was fetched.
-		cmdList(nil)
-	case "show":
-		cache, err := usage.LoadCache()
-		if err != nil {
-			fail(err)
-		}
-		out, err := json.MarshalIndent(cache, "", "  ")
-		if err != nil {
-			fail(err)
-		}
-		fmt.Println(string(out))
-	default:
-		fmt.Fprintln(os.Stderr, "usage: anthropool usage refresh | anthropool usage show")
-		os.Exit(2)
 	}
+	// Requiring an error too keeps the empty pool at exit 0: with no
+	// accounts there is nothing to poll and nothing has gone wrong.
+	if polled == 0 && len(errs) > 0 {
+		os.Exit(1)
+	}
+}
+
+func cmdUsageShow(args []string) {
+	cache, err := usage.LoadCache()
+	if err != nil {
+		fail(err)
+	}
+	out, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		fail(err)
+	}
+	fmt.Println(string(out))
 }
 
 // --- Wrapper -------------------------------------------------------------
@@ -1150,45 +1596,53 @@ func cmdSetup(args []string) {
 	} else {
 		fmt.Printf("✓ Installed hooks: %s\n", strings.Join(changed, ", "))
 	}
-	if err := offerUpdateCheckOptIn(); err != nil {
+	if err := enableUpdateChecks(); err != nil {
 		fail(err)
 	}
 	if err := offerYoloAlias(); err != nil {
 		fail(err)
 	}
-	if err := offerConfigSetup(); err != nil {
-		fail(err)
-	}
+	printSetupFooter()
+}
+
+// printSetupFooter prints the post-install next-steps, help hint,
+// GitHub star ask, and support link.
+func printSetupFooter() {
+	g, r, b := colorGray, colorReset, colorBold
+
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Run `anthropool add` or `/anthropool:add` while logged in to each account you want to manage.")
-	fmt.Println("  2. Restart Claude Code (or start a new session) so it picks up the hooks.")
-	fmt.Println("  3. Launch sessions with `anthropool` instead of `claude`, then use /switch and /anthropool:* inside.")
+	fmt.Println("  2. Use `anthropool` instead of `claude` to start sessions.")
+	fmt.Println("  3. Use /switch or /anthropool:* inside Claude to manage accounts.")
+	fmt.Println()
+	fmt.Printf("  %sRun `anthropool help` to see all available commands.%s\n", b, r)
+	fmt.Println()
+	fmt.Printf("%s────────────────────────────────────────────────%s\n", g, r)
+	fmt.Printf("  %s⭐  Enjoying anthropool? Star the repo on GitHub:%s\n", b, r)
+	fmt.Println("     https://github.com/Dave-Nguyen-PM/anthropool")
+	fmt.Println()
+	fmt.Println("  💛  Support development:")
+	fmt.Println("     https://support.dave.com")
+	fmt.Printf("%s────────────────────────────────────────────────%s\n", g, r)
+	fmt.Println()
 }
 
-// offerConfigSetup shows the current config summary and offers to open
-// the interactive editor so users can tune settings during first-run setup.
-func offerConfigSetup() error {
-	if !stdinIsTTY() {
-		return nil
-	}
-	c, err := config.Load()
+// enableUpdateChecks silently ensures update checks are on in the saved
+// config. No output — it's a background concern, not a user-facing step.
+func enableUpdateChecks() error {
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	setTheme(c.Theme)
-	fmt.Println()
-	printSetupConfigSummary(c)
-	fmt.Print("Customize these settings now? [y/N] ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return err
+	if cfg.UpdateCheck.Enabled && cfg.UpdateCheck.CadenceHours >= 1 {
+		return nil
 	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	if answer == "y" || answer == "yes" {
-		return editConfigInteractive()
+	cfg.UpdateCheck.Enabled = true
+	if cfg.UpdateCheck.CadenceHours < 1 {
+		cfg.UpdateCheck.CadenceHours = 6
 	}
-	return nil
+	return config.Save(cfg)
 }
 
 // printSetupConfigSummary renders a compact table of the most important
@@ -1271,36 +1725,6 @@ func stripANSI(s string) string {
 	return string(out)
 }
 
-func offerUpdateCheckOptIn() error {
-	if !stdinIsTTY() {
-		return nil
-	}
-	fmt.Println()
-	fmt.Print("Check for anthropool updates daily on startup? [y/N] ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return err
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	cfg.UpdateCheck.Enabled = answer == "y" || answer == "yes"
-	if cfg.UpdateCheck.CadenceHours < 1 {
-		cfg.UpdateCheck.CadenceHours = 6
-	}
-	if err := config.Save(cfg); err != nil {
-		return err
-	}
-	if cfg.UpdateCheck.Enabled {
-		fmt.Println("✓ Daily update checks enabled")
-	} else {
-		fmt.Println("✓ Daily update checks disabled")
-	}
-	return nil
-}
-
 func stdinIsTTY() bool {
 	fi, err := os.Stdin.Stat()
 	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
@@ -1378,28 +1802,47 @@ func cmdUpgrade(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	kind, installDir := detectInstall(exe)
-	switch kind {
-	case "npm":
+
+	if isNPMInstall(filepath.Dir(exe)) {
+		// npm manages its own package metadata (package.json, bin shims,
+		// postinstall scripts), so let npm do the upgrade itself.
 		runUpgradeCommand("npm", "install", "-g", "@Dave-Nguyen-PM/anthropool@latest")
-	case "installer":
-		cmd := exec.Command("sh", "-c", "curl -fsSL https://raw.githubusercontent.com/Dave-Nguyen-PM/anthropool/main/scripts/install.sh | sh")
-		cmd.Env = append(os.Environ(), "ANTHROPOOL_INSTALL_DIR="+installDir)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		if err := cmd.Run(); err != nil {
+	} else {
+		// For every other install method — shell installer, manual binary
+		// download, Homebrew tap, Windows, etc. — use the built-in Go
+		// self-updater: no sh, no curl, no PowerShell required.
+		if err := updater.SelfUpdate(exe); err != nil {
 			fail(err)
 		}
-	default:
-		fmt.Println("anthropool: could not detect how this binary was installed.")
-		fmt.Println()
-		fmt.Println("If you installed with npm, run:")
-		fmt.Println("  npm install -g @Dave-Nguyen-PM/anthropool@latest")
-		fmt.Println()
-		fmt.Println("If you installed with the shell installer, run:")
-		fmt.Println("  curl -fsSL https://raw.githubusercontent.com/Dave-Nguyen-PM/anthropool/main/scripts/install.sh | sh")
 	}
+	// Clear the on-disk cache so the next run re-fetches instead of
+	// immediately showing "update available" for the version just installed.
+	clearUpdateCache()
+	printSupportNotice()
+}
+
+// printSupportNotice shares one throttle with the wrapper's exit line, so a
+// user who saw it on exit yesterday does not see it again for upgrading
+// today. An upgrade is the better of the two moments — the user chose to run
+// it, and nothing is waiting on them — so it is worth spending the window on.
+func printSupportNotice() {
+	cfg, err := config.Load()
+	if err != nil || !cfg.SupportNotice {
+		return
+	}
+	if !term.IsTerminal(int(os.Stdout.Fd())) {
+		return
+	}
+	if supportnotice.Due(time.Now()) {
+		fmt.Printf("\n%s\n", supportnotice.Line())
+	}
+}
+
+// clearUpdateCache removes the on-disk update cache so the next run
+// re-fetches from GitHub instead of showing a stale "update available"
+// notice for a release that was just installed.
+func clearUpdateCache() {
+	_ = os.Remove(updater.CachePath())
 }
 
 func runUpgradeCommand(name string, args ...string) {
@@ -1410,27 +1853,6 @@ func runUpgradeCommand(name string, args ...string) {
 	if err := cmd.Run(); err != nil {
 		fail(err)
 	}
-}
-
-func detectInstall(exe string) (kind, installDir string) {
-	exe, _ = filepath.Abs(exe)
-	dir := filepath.Dir(exe)
-	if isNPMInstall(dir) {
-		return "npm", ""
-	}
-	if envDir := os.Getenv("ANTHROPOOL_INSTALL_DIR"); envDir != "" {
-		if sameDir(dir, envDir) {
-			return "installer", dir
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		localBin := filepath.Join(home, ".local", "bin")
-		if sameDir(dir, localBin) {
-			return "installer", dir
-		}
-	}
-	return "", ""
 }
 
 func isNPMInstall(binDir string) bool {
@@ -1495,12 +1917,18 @@ func renderColorBar(pct float64, barW int) string {
 }
 
 // accountState returns the display label for one row in the account table.
-func accountState(email, liveEmail string, au usage.AccountUsage) string {
+func accountState(email, liveEmail string, au usage.AccountUsage, stale bool) string {
 	if au.TokenExpired {
 		return "EXPRD"
 	}
 	if email == liveEmail {
 		return "ACTIVE"
+	}
+	// Below this point every verdict is read off the usage numbers, so a
+	// reading that has stopped tracking reality can only produce a guess
+	// dressed as a fact — say STALE instead of picking one (issue #46).
+	if stale {
+		return "STALE"
 	}
 	if au.FiveHour != nil && au.FiveHour.Utilization >= 100 {
 		return "FULL"
@@ -1616,10 +2044,16 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 
 	noBar := strings.Repeat(" ", 10) + g + "─" + r + strings.Repeat(" ", 11)
 
+	// A stale row shows "?" rather than a number, because a percentage and a
+	// bar are claims about right now and the reading no longer supports one.
+	unknownBar := strings.Repeat(" ", 10) + colorYellow + "?" + r + strings.Repeat(" ", 11)
+
+	now := time.Now()
 	for _, slot := range slots {
 		a := st.Accounts[slot]
-		au := cache[a.CacheKey()]
-		sl := accountState(a.Email, liveEmail, au)
+		au := cachedAccountUsage(cache, a)
+		stale := au.StaleReading(now)
+		sl := accountState(a.Email, liveEmail, au, stale)
 
 		var sc string
 		switch sl {
@@ -1627,26 +2061,48 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 			sc = colorGreen
 		case "FULL", "EXPRD":
 			sc = colorYellow
+		case "STALE":
+			sc = colorYellow
 		default:
 			sc = t
 		}
 
 		resetStr := nextReset(au)
+		if stale {
+			// nextReset renders any elapsed instant as "now", which for a
+			// reading days out of date is the most confident possible way to
+			// be wrong.
+			resetStr = "?"
+		}
 
 		var barFive, barSeven string
-		if au.FiveHour != nil {
-			barFive = " " + renderColorBar(au.FiveHour.Utilization, barBlocks) + " "
-		} else {
-			barFive = noBar
-		}
-		if au.SevenDay != nil {
-			barSeven = " " + renderColorBar(au.SevenDay.Utilization, barBlocks) + " "
-		} else {
-			barSeven = noBar
+		switch {
+		case stale:
+			barFive, barSeven = unknownBar, unknownBar
+		default:
+			if au.FiveHour != nil {
+				barFive = " " + renderColorBar(au.FiveHour.Utilization, barBlocks) + " "
+			} else {
+				barFive = noBar
+			}
+			if au.SevenDay != nil {
+				barSeven = " " + renderColorBar(au.SevenDay.Utilization, barBlocks) + " "
+			} else {
+				barSeven = noBar
+			}
 		}
 
 		slotCell := "  " + b + fmt.Sprintf("%02d", slot) + r + "  "
-		emailCell := " " + t + padTo(a.Email, colEmailW-2) + r + " "
+		// ACCOUNT cell: if an alias is set, show "alias · email" truncated to
+		// fit colEmailW; otherwise show email as before.
+		var accountLabel string
+		if a.Alias != "" {
+			full := a.Alias + " · " + a.Email
+			accountLabel = padTo(full, colEmailW-2)
+		} else {
+			accountLabel = padTo(a.Email, colEmailW-2)
+		}
+		emailCell := " " + t + accountLabel + r + " "
 		stateCell := " " + sc + padTo(sl, colStateW-2) + r + " "
 		resetCell := " " + t + padTo(resetStr, colResetW-2) + r + " "
 
@@ -1661,52 +2117,105 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 	}
 
 	fmt.Fprintln(w, tableSep("└", "┴", "┘"))
+	printStaleBanner(w, st, cache, now)
+}
+
+// printStaleBanner says out loud that some of the table above is not a
+// current reading. Without it a frozen cache is indistinguishable from a
+// fresh one on the surface users actually look at (issue #46).
+func printStaleBanner(w io.Writer, st *store.State, cache usage.Cache, now time.Time) {
+	keys := make([]string, 0, len(st.Accounts))
+	for _, slot := range st.SortedSlots() {
+		keys = append(keys, st.Accounts[slot].CacheKey())
+	}
+	sn := cache.Staleness(keys, now)
+	if !sn.Any() {
+		return
+	}
+	scope := fmt.Sprintf("%d of %d accounts", sn.Stale, sn.Total)
+	if sn.All() {
+		scope = "every account"
+	}
+	fmt.Fprintf(w, "\n %s⚠ USAGE DATA STALE%s — %s last polled %s ago; the numbers above are not current.\n",
+		colorYellow, colorReset, scope, usage.HumanAge(sn.Oldest))
+	fmt.Fprintf(w, " %sRun `anthropool usage refresh` to see why polling is failing.%s\n\n", colorGray, colorReset)
+}
+
+func cachedAccountUsage(cache usage.Cache, acct store.Account) usage.AccountUsage {
+	if cache == nil {
+		return usage.AccountUsage{}
+	}
+	if u, ok := cache[acct.CacheKey()]; ok {
+		return u
+	}
+	if acct.CacheKey() != acct.Email {
+		if u, ok := cache[acct.Email]; ok {
+			return u
+		}
+	}
+	return usage.AccountUsage{}
 }
 
 func renderSupport(useANSI bool) string {
 	var b strings.Builder
-	b.WriteString(":: A N T H R O P O O L   S U P P O R T ::\n\n")
+	b.WriteString(":: C U X   S U P P O R T ::\n\n")
 	b.WriteString("Support anthropool development:\n")
 	b.WriteString(donateURL)
 	b.WriteString("\n")
 	return b.String()
 }
 
-func printHelp() {
-	fmt.Println(`anthropool — Run multiple Claude Code Pro/Max accounts as one
+// helpText is prose on purpose — it groups, annotates and wraps in ways a
+// generated list cannot. TestHelpCoversEveryPublicCommand keeps it honest
+// against the command table instead.
+const helpText = `anthropool — Run multiple Claude Code Pro/Max accounts as one
 
 USAGE
-  anthropool [claude-args...]              run claude under the wrapper (default)
-  anthropool run [claude-args...]          same, explicit
-  anthropool add [--slot N]                add the currently logged-in account
-  anthropool list                          list managed accounts
-  anthropool switch <slot|email>           swap the active account (manual; requires
-                                    restart unless run from /switch inside)
-  anthropool force-switch [slot|email]     emergency swap for an active anthropool session
-                                    when Claude will not run /switch
-  anthropool remove [--force] <slot|email> remove an account from anthropool
-  anthropool status                        show live login + anthropool state
-  anthropool support                       show support URL
-  anthropool docs                          show documentation URL
-  anthropool setup                         install /switch, /anthropool:* + Claude Code hooks
-  anthropool install-hooks                 install Claude Code hooks only
-  anthropool uninstall-hooks               remove anthropool's entries from settings.json
-  anthropool history [-n N] [--json]       show recent account swaps
-  anthropool history --clear               delete the swap history
-  anthropool config show                   print current configuration
-  anthropool config keys                   list every settable key
-  anthropool config edit                   interactive settings editor
-  anthropool config set <key> <value>      update a single setting
-  anthropool usage refresh                 fetch fresh usage for every account
-  anthropool usage show                    print the on-disk usage cache (JSON)
-  anthropool upgrade                       update anthropool using npm or the installer
-  anthropool hook <event>                  internal: invoked by Claude Code
-  anthropool version                       print version
+  anthropool [claude-args...]                    run claude under the wrapper (default)
+  anthropool run [claude-args...]                same, explicit
+  anthropool add [--slot N] [--alias NAME] [--no-alias] [--force]
+                                          add the currently logged-in account
+  anthropool list                                list managed accounts
+  anthropool alias <slot|email|alias> <name>     set a short alias (e.g. work, personal)
+  anthropool project create <name> [--dir PATH]  scope a directory to its own seat pool
+  anthropool project assign <name> <seat> [...]  add seats to a project (seats can be shared)
+  anthropool project unassign <name> <seat> [...]
+  anthropool project list [--refresh]            projects + live usage of their seats
+  anthropool project stats <name>                usage detail for one project
+  anthropool project remove <name>               unbind a directory (accounts untouched)
+  anthropool alias <slot|email|alias> --clear    remove alias
+  anthropool switch <slot|email|alias>           swap the active account (manual; requires
+                                          restart unless run from /switch inside)
+  anthropool force-switch [slot|email|alias]     emergency swap for an active anthropool session
+                                          when Claude will not run /switch
+  anthropool remove [--force] <slot|email|alias> remove an account from anthropool
+  anthropool status                              show live login + anthropool state
+  anthropool sessions                            list running anthropool sessions, and recently ended ones with their resume line
+  anthropool attach [pid]                        watch and control a running session
+  anthropool support                             show support URL
+  anthropool docs                                show documentation URL
+  anthropool setup                               install /switch, /anthropool:* + Claude Code hooks
+  anthropool install-hooks                       install Claude Code hooks only
+  anthropool uninstall-hooks                     remove anthropool's entries from settings.json
+  anthropool history [-n N] [--json]             show recent account swaps
+  anthropool history --clear                     delete the swap history
+  anthropool config show                         print current configuration
+  anthropool config keys                         list every settable key
+  anthropool config edit                         interactive settings editor
+  anthropool config set <key> <value>            update a single setting
+  anthropool usage refresh                       fetch fresh usage for every account
+  anthropool usage show                          print the on-disk usage cache (JSON)
+  anthropool commands                            print anthropool's command surface (JSON)
+  anthropool upgrade                             update anthropool using npm or the installer
+  anthropool hook <event>                        internal: invoked by Claude Code
+  anthropool version                             print version
+  anthropool help                                show this help
 
 INLINE SWITCHING
-  Once set up, type /switch [<slot|email>] from inside a Claude Code
+  Once set up, type /switch [<slot|email|alias>] from inside a Claude Code
   session started via anthropool. You can also use /anthropool:switch, /anthropool:add,
   /anthropool:list, /anthropool:status, /anthropool:support, /anthropool:config, /anthropool:remove,
   and /anthropool:usage-refresh from inside the
-  session. Manual and rate-limit swaps reconnect with --resume.`)
-}
+  session. Manual and rate-limit swaps reconnect with --resume.`
+
+func printHelp() { fmt.Println(helpText) }

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Dave-Nguyen-PM/anthropool/internal/atomicfile"
@@ -26,29 +27,135 @@ type Account struct {
 	Email    string    `json:"email"`
 	UUID     string    `json:"uuid"`
 	OrgUUID  string    `json:"orgUuid,omitempty"`
+	Alias    string    `json:"alias,omitempty"`
 	AddedAt  time.Time `json:"addedAt"`
 	LastUsed time.Time `json:"lastUsed,omitempty"`
 }
 
-// CacheKey returns the usage-cache key for this account. When OrgUUID is
-// set it is used as the key so two accounts sharing the same email get
-// independent cache entries. Falls back to email for legacy slots.
+// CacheKey returns the usage-cache key for this account. Usage limits are
+// tracked per seat — one (account, organization) pair — so the key combines
+// both UUIDs: two accounts sharing an email but in different orgs get
+// distinct entries, and so do different accounts inside the same org
+// (keying on OrgUUID alone made those collapse into one entry that every
+// refresh overwrote). Falls back to OrgUUID, then email, for legacy slots
+// recorded before these fields existed.
 func (a Account) CacheKey() string {
+	if a.UUID != "" && a.OrgUUID != "" {
+		return a.UUID + "|" + a.OrgUUID
+	}
 	if a.OrgUUID != "" {
 		return a.OrgUUID
 	}
 	return a.Email
 }
 
+// LiveSeat returns the managed account that the currently-live login belongs
+// to, given whatever identity the live token yields.
+//
+// It exists because the two sides can spell one seat differently. A seat
+// added before anthropool captured account UUIDs stores none, so its CacheKey()
+// falls back to its email — while the same seat read from the live token
+// keys on uuid|org. Code that compared those two spellings directly decided
+// the live seat was not in the pool, and rotation then offered the seat the
+// session was already on.
+//
+// Resolved against the store rather than the token, so callers get a key
+// built by the same function as every candidate's.
+func (s *State) LiveSeat(liveEmail, liveCacheKey string) (Account, bool) {
+	if s == nil {
+		return Account{}, false
+	}
+	if liveCacheKey != "" {
+		// ActiveSlot breaks a tie first. Twin seats — a personal plan and an
+		// org plan on one address (#24) — key on that address whenever
+		// neither has a stored UUID, so two accounts can answer to the same
+		// key and ranging the map would choose between them at random.
+		if a, ok := s.Accounts[s.ActiveSlot]; ok && a.CacheKey() == liveCacheKey {
+			return a, true
+		}
+		for _, slot := range s.SortedSlots() {
+			if a, ok := s.Accounts[slot]; ok && a.CacheKey() == liveCacheKey {
+				return a, true
+			}
+		}
+	}
+	// No key matched: the store has no UUID for this seat. ActiveSlot is its
+	// own record of which one is live, so trust it — but only when it agrees
+	// with the live email, or a stale ActiveSlot would mask a real mismatch.
+	// An exact key match above always wins over this, so a stale ActiveSlot
+	// never steals a seat that identified itself properly.
+	if a, ok := s.Accounts[s.ActiveSlot]; ok && liveEmail != "" && strings.EqualFold(a.Email, liveEmail) {
+		return a, true
+	}
+	return Account{}, false
+}
+
+// BackfillIdentities fills in the account UUIDs that state.json is missing,
+// reading each from the seat's own stored oauthAccount backup.
+//
+// A seat with no identity keys on its email address (Account.CacheKey), and
+// two seats can share one address — a personal plan beside an org plan
+// (#24). Those two then answer to one usage-cache key and overwrite each
+// other's readings, and nothing downstream can tell them apart. The identity
+// was on disk the whole time; only state.json went without it, because these
+// seats were added before anthropool recorded it.
+//
+// Returns the cache keys that changed, old -> new, so the caller can carry
+// each seat's reading across instead of dropping it. A key that two seats
+// shared maps to "": its reading is a blend of both and belongs to neither,
+// so the caller should discard it and let the next poll write real ones.
+func (s *State) BackfillIdentities() map[string]string {
+	if s == nil {
+		return nil
+	}
+	var renamed map[string]string
+	for slot, a := range s.Accounts {
+		if a.UUID != "" || a.OrgUUID != "" {
+			continue
+		}
+		raw, err := ReadOAuthBlockBackup(slot, a.Email)
+		if err != nil {
+			continue
+		}
+		var parsed struct {
+			AccountUUID      string `json:"accountUuid"`
+			OrganizationUUID string `json:"organizationUuid"`
+		}
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			continue
+		}
+		if parsed.AccountUUID == "" && parsed.OrganizationUUID == "" {
+			continue
+		}
+		before := a.CacheKey()
+		a.UUID, a.OrgUUID = parsed.AccountUUID, parsed.OrganizationUUID
+		s.Accounts[slot] = a
+		after := a.CacheKey()
+		if after == before {
+			continue
+		}
+		if renamed == nil {
+			renamed = map[string]string{}
+		}
+		if _, clash := renamed[before]; clash {
+			renamed[before] = "" // twins shared it; it describes neither
+			continue
+		}
+		renamed[before] = after
+	}
+	return renamed
+}
+
 // State is the on-disk shape of state.json.
 type State struct {
-	Version          int             `json:"version"`
-	ActiveSlot       int             `json:"activeSlot"`
-	LastUpdated      time.Time       `json:"lastUpdated"`
-	Sequence         []int           `json:"sequence"` // user-visible ordering for `anthropool switch` rotation
-	Accounts         map[int]Account `json:"accounts"`
-	ManualSwitchEmail string         `json:"manualSwitchEmail,omitempty"`
-	ManualSwitchAt    time.Time      `json:"manualSwitchAt,omitempty"`
+	Version           int                `json:"version"`
+	ActiveSlot        int                `json:"activeSlot"`
+	LastUpdated       time.Time          `json:"lastUpdated"`
+	Sequence          []int              `json:"sequence"` // user-visible ordering for `anthropool switch` rotation
+	Accounts          map[int]Account    `json:"accounts"`
+	Projects          map[string]Project `json:"projects,omitempty"` // per-directory account pools
+	ManualSwitchEmail string             `json:"manualSwitchEmail,omitempty"`
+	ManualSwitchAt    time.Time          `json:"manualSwitchAt,omitempty"`
 }
 
 var (
@@ -58,6 +165,22 @@ var (
 )
 
 var emailRE = regexp.MustCompile(`^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`)
+
+// aliasRE accepts 1–20 lowercase alphanumeric + hyphen characters that start
+// with a letter. This ensures aliases can never be confused with slot numbers
+// (which are purely numeric) or email addresses (which contain @).
+var aliasRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,19}$`)
+
+// ValidateAlias returns an error if s is not a valid alias.
+func ValidateAlias(s string) error {
+	if !aliasRE.MatchString(s) {
+		return fmt.Errorf("store: alias %q must start with a letter, contain only lowercase letters, digits, or hyphens, and be at most 20 chars", s)
+	}
+	return nil
+}
+
+// ErrAliasExists is returned when the requested alias is already taken.
+var ErrAliasExists = errors.New("store: alias already in use")
 
 func ValidateEmail(s string) error {
 	if !emailRE.MatchString(s) {
@@ -91,6 +214,7 @@ func Load() (*State, error) {
 		LastUpdated       time.Time          `json:"lastUpdated"`
 		Sequence          []int              `json:"sequence"`
 		Accounts          map[string]Account `json:"accounts"`
+		Projects          map[string]Project `json:"projects,omitempty"`
 		ManualSwitchEmail string             `json:"manualSwitchEmail,omitempty"`
 		ManualSwitchAt    time.Time          `json:"manualSwitchAt,omitempty"`
 	}
@@ -104,6 +228,7 @@ func Load() (*State, error) {
 		LastUpdated:       raw.LastUpdated,
 		Sequence:          raw.Sequence,
 		Accounts:          make(map[int]Account, len(raw.Accounts)),
+		Projects:          raw.Projects,
 		ManualSwitchEmail: raw.ManualSwitchEmail,
 		ManualSwitchAt:    raw.ManualSwitchAt,
 	}
@@ -141,9 +266,10 @@ func (s *State) Save() error {
 		LastUpdated       time.Time          `json:"lastUpdated"`
 		Sequence          []int              `json:"sequence"`
 		Accounts          map[string]Account `json:"accounts"`
+		Projects          map[string]Project `json:"projects,omitempty"`
 		ManualSwitchEmail string             `json:"manualSwitchEmail,omitempty"`
 		ManualSwitchAt    time.Time          `json:"manualSwitchAt,omitempty"`
-	}{s.Version, s.ActiveSlot, s.LastUpdated, s.Sequence, accounts, s.ManualSwitchEmail, s.ManualSwitchAt}
+	}{s.Version, s.ActiveSlot, s.LastUpdated, s.Sequence, accounts, s.Projects, s.ManualSwitchEmail, s.ManualSwitchAt}
 
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
@@ -185,20 +311,64 @@ func (s *State) FindByIdentity(email, orgUUID string) int {
 
 // Resolve accepts either a slot number ("2") or an email and returns
 // the matching account. Returns ErrAccountMissing if neither matches.
+// FindByAlias returns the slot for a given alias (case-insensitive), or 0 if
+// none. Aliases are stored lowercase so normalising here is defensive.
+func (s *State) FindByAlias(alias string) int {
+	alias = strings.ToLower(strings.TrimSpace(alias))
+	for slot, a := range s.Accounts {
+		if strings.ToLower(a.Alias) == alias {
+			return slot
+		}
+	}
+	return 0
+}
+
+// Resolve accepts a slot number, email, or alias and returns the matching
+// account. Returns ErrAccountMissing if none matches.
 func (s *State) Resolve(identifier string) (Account, error) {
+	// 1. Slot number.
 	if n, err := strconv.Atoi(identifier); err == nil {
 		if a, ok := s.Accounts[n]; ok {
 			return a, nil
 		}
 		return Account{}, fmt.Errorf("%w: slot %d", ErrAccountMissing, n)
 	}
+	// 2. Alias (before email, so "work" never hits the email validator).
+	if slot := s.FindByAlias(identifier); slot != 0 {
+		return s.Accounts[slot], nil
+	}
+	// 3. Email.
 	if err := ValidateEmail(identifier); err != nil {
-		return Account{}, err
+		// Not a number, not a known alias, not a valid email.
+		return Account{}, fmt.Errorf("%w: %q (use slot number, email, or alias)", ErrAccountMissing, identifier)
 	}
 	if slot := s.FindByEmail(identifier); slot != 0 {
 		return s.Accounts[slot], nil
 	}
 	return Account{}, fmt.Errorf("%w: %s", ErrAccountMissing, identifier)
+}
+
+// SetAlias assigns (or clears) the alias for a managed account. Validates the
+// alias and ensures it is unique. Pass alias="" to clear.
+func (s *State) SetAlias(slot int, alias string) error {
+	a, ok := s.Accounts[slot]
+	if !ok {
+		return fmt.Errorf("%w: slot %d", ErrAccountMissing, slot)
+	}
+	if alias == "" {
+		a.Alias = ""
+		s.Accounts[slot] = a
+		return nil
+	}
+	if err := ValidateAlias(alias); err != nil {
+		return err
+	}
+	if existing := s.FindByAlias(alias); existing != 0 && existing != slot {
+		return fmt.Errorf("%w: %q is already used by slot %d (%s)", ErrAliasExists, alias, existing, s.Accounts[existing].Email)
+	}
+	a.Alias = alias
+	s.Accounts[slot] = a
+	return nil
 }
 
 // NextSlot returns the lowest unused positive slot number. Reusing
@@ -247,6 +417,10 @@ func (s *State) Remove(slot int) error {
 		return fmt.Errorf("%w: slot %d", ErrAccountMissing, slot)
 	}
 	delete(s.Accounts, slot)
+	// A removed account must not linger in any project pool.
+	for name := range s.Projects {
+		_ = s.UnassignProjectSlot(name, slot)
+	}
 	out := s.Sequence[:0]
 	for _, n := range s.Sequence {
 		if n != slot {
