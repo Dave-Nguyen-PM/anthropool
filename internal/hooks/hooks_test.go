@@ -19,7 +19,7 @@ import (
 
 func TestRenderPromptSupportIncludesURL(t *testing.T) {
 	out := renderPromptSupport()
-	if !strings.Contains(out, "https://support.dave.com") {
+	if !strings.Contains(out, "https://github.com/Dave-Nguyen-PM/anthropool/issues") {
 		t.Fatalf("support output missing URL: %q", out)
 	}
 	if strings.Contains(out, "\x1b[") {

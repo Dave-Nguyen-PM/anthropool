@@ -1,6 +1,6 @@
 # Installation
 
-Full docs online: **https://anthropool.dave.com/docs**
+Full docs online: **https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs**
 
 Three ways to install `anthropool`. Pick the one that fits your setup.
 

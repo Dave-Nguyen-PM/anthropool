@@ -12,7 +12,7 @@ import (
 	"github.com/Dave-Nguyen-PM/anthropool/internal/paths"
 )
 
-const URL = "https://support.dave.com"
+const URL = "https://github.com/Dave-Nguyen-PM/anthropool/issues"
 
 const (
 	FirstDelay = 7 * 24 * time.Hour
@@ -65,7 +65,7 @@ func Due(now time.Time) bool {
 // Line is the notice. One line, no colour: it prints under the
 // `anthropool --resume <id>` line, which is the one the user is there to read.
 func Line() string {
-	return "If anthropool is useful to you, consider supporting it: " + URL
+	return "Need help or found a bug? Open an issue: " + URL
 }
 
 func load(p string) (state, error) {

@@ -17,8 +17,8 @@ anthropool add        # or /anthropool:add inside Claude while logged in
 For full documentation (auto-swap on rate-limit, threshold-based
 swaps, strategies, history, configuration), see the main repository:
 
-- **Docs:** https://anthropool.dave.com/docs
-- **Website:** https://anthropool.dave.com
+- **Docs:** https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs
+- **Website:** https://github.com/Dave-Nguyen-PM/anthropool
 - **README:** https://github.com/Dave-Nguyen-PM/anthropool#readme
 - **Releases:** https://github.com/Dave-Nguyen-PM/anthropool/releases
 - **Issues:** https://github.com/Dave-Nguyen-PM/anthropool/issues
@@ -62,7 +62,7 @@ npm prefix -g
 
 Then add the output (e.g. `C:\Users\Admin\AppData\Roaming\npm`) to your `Path` via System Properties → Environment Variables → User variables → Path → New.
 
-Open a new terminal window after saving. Full instructions: https://anthropool.dave.com/docs
+Open a new terminal window after saving. Full instructions: https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs
 
 **Postinstall failed to download the binary**
 
@@ -76,7 +76,7 @@ If you are behind a corporate proxy, set `HTTPS_PROXY` first. Or download the bi
 
 Hooks run in non-interactive shells. Add your PATH setup to `~/.zprofile` (macOS) or `~/.profile` (Linux), not just `~/.zshrc` / `~/.bashrc`.
 
-More: https://anthropool.dave.com/docs
+More: https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs
 
 ---
 
@@ -86,5 +86,5 @@ GPL-3.0-only — see https://github.com/Dave-Nguyen-PM/anthropool/blob/main/LICE
 
 ---
 
-If anthropool saves you time, you can support development at
-[support.dave.com](https://support.dave.com).
+Need help or found a bug? Open an issue on
+[GitHub Issues](https://github.com/Dave-Nguyen-PM/anthropool/issues).

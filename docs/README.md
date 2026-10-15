@@ -1,6 +1,6 @@
 # anthropool docs
 
-Full docs online: **https://anthropool.dave.com/docs**
+Full docs online: **https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs**
 
 | Guide | Description |
 |---|---|

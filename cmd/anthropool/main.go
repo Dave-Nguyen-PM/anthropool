@@ -57,10 +57,10 @@ import (
 var version = "1.0.1"
 
 const (
-	// donateURL is shown only by `anthropool version --verbose`. Subtle by
+	// donateURL (the issue tracker) is shown only by `anthropool version --verbose`. Subtle by
 	// design — never printed during normal use, never injected into
 	// help output, never shown by the wrapper or the slash command.
-	donateURL = "https://support.dave.com"
+	donateURL = "https://github.com/Dave-Nguyen-PM/anthropool/issues"
 )
 
 func main() {
@@ -818,7 +818,7 @@ func cmdVersion(args []string) {
 	fmt.Println("anthropool", version)
 	if verbose {
 		fmt.Println()
-		fmt.Println("If anthropool saves you time, you can support development at", donateURL)
+		fmt.Println("Need help or found a bug? Open an issue at", donateURL)
 	}
 }
 
@@ -840,9 +840,9 @@ func cmdDocs(args []string) {
 
 func renderDocs(useANSI bool) string {
 	var b strings.Builder
-	b.WriteString(":: C U X   D O C S ::\n\n")
+	b.WriteString(":: A N T H R O P O O L   D O C S ::\n\n")
 	b.WriteString("Full documentation:\n")
-	b.WriteString("  https://anthropool.dave.com/docs\n\n")
+	b.WriteString("  https://github.com/Dave-Nguyen-PM/anthropool/tree/main/docs\n\n")
 	b.WriteString("Topics covered:\n")
 	b.WriteString("  · Installation (npm, shell, manual binary)\n")
 	b.WriteString("  · Windows, macOS, Linux edge cases\n")
@@ -1108,7 +1108,7 @@ func editConfigInteractive() error {
 
 func printConfigEditor(c config.Config) {
 	fmt.Print("\033[H\033[2J")
-	fmt.Printf("%s:: C U X   S E T T I N G S ::%s\r\n\r\n", colorBold, colorReset)
+	fmt.Printf("%s:: A N T H R O P O O L   S E T T I N G S ::%s\r\n\r\n", colorBold, colorReset)
 	fmt.Printf("%sToggle booleans by selecting their number. Numeric/text settings prompt for a value.%s\r\n", colorGray, colorReset)
 	fmt.Printf("%sPress Enter on an empty prompt to go back/cancel. Press Esc or q to exit.%s\r\n\r\n", colorGray, colorReset)
 
@@ -1622,8 +1622,8 @@ func printSetupFooter() {
 	fmt.Printf("  %s⭐  Enjoying anthropool? Star the repo on GitHub:%s\n", b, r)
 	fmt.Println("     https://github.com/Dave-Nguyen-PM/anthropool")
 	fmt.Println()
-	fmt.Println("  💛  Support development:")
-	fmt.Println("     https://support.dave.com")
+	fmt.Println("  🐞  Help & bug reports:")
+	fmt.Println("     https://github.com/Dave-Nguyen-PM/anthropool/issues")
 	fmt.Printf("%s────────────────────────────────────────────────%s\n", g, r)
 	fmt.Println()
 }
@@ -2158,8 +2158,8 @@ func cachedAccountUsage(cache usage.Cache, acct store.Account) usage.AccountUsag
 
 func renderSupport(useANSI bool) string {
 	var b strings.Builder
-	b.WriteString(":: C U X   S U P P O R T ::\n\n")
-	b.WriteString("Support anthropool development:\n")
+	b.WriteString(":: A N T H R O P O O L   S U P P O R T ::\n\n")
+	b.WriteString("Get help or report a bug:\n")
 	b.WriteString(donateURL)
 	b.WriteString("\n")
 	return b.String()

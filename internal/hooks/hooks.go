@@ -655,7 +655,7 @@ func renderPromptConfig(args []string) (string, error) {
 		}
 		keys := config.Keys(c)
 		var b strings.Builder
-		b.WriteString(":: C U X   S E T T I N G S ::\n\n")
+		b.WriteString(":: A N T H R O P O O L   S E T T I N G S ::\n\n")
 		b.WriteString("┌─────────────────────────────┬──────────────────────┬────────────────────────────────────────────┐\n")
 		b.WriteString("│ KEY                         │ VALUE                │ NOTES                                      │\n")
 		b.WriteString("├─────────────────────────────┼──────────────────────┼────────────────────────────────────────────┤\n")
@@ -672,7 +672,7 @@ func renderPromptConfig(args []string) (string, error) {
 		b.WriteString("EXAMPLE  /anthropool:config set strategy.kind balanced")
 		return b.String(), nil
 	case "edit":
-		return ":: C U X   S E T T I N G S ::\n\nInteractive settings editor is terminal-only.\nRun this outside Claude:\n\n  anthropool config edit", nil
+		return ":: A N T H R O P O O L   S E T T I N G S ::\n\nInteractive settings editor is terminal-only.\nRun this outside Claude:\n\n  anthropool config edit", nil
 	case "set":
 		if len(args) != 3 {
 			return "", fmt.Errorf("usage: /anthropool:config set <key> <value>")
@@ -688,14 +688,14 @@ func renderPromptConfig(args []string) (string, error) {
 		if err := config.Save(c); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf(":: C U X   S E T T I N G S ::\n\nUPDATED  %s = %s", args[1], args[2]), nil
+		return fmt.Sprintf(":: A N T H R O P O O L   S E T T I N G S ::\n\nUPDATED  %s = %s", args[1], args[2]), nil
 	default:
 		return "", fmt.Errorf("usage: /anthropool:config show | keys | set <key> <value>")
 	}
 }
 
 func renderPromptSupport() string {
-	return "ANTHROPOOL SUPPORT\n\nSupport anthropool development:\nhttps://support.dave.com"
+	return "ANTHROPOOL SUPPORT\n\nGet help or report a bug:\nhttps://github.com/Dave-Nguyen-PM/anthropool/issues"
 }
 
 func displayConfigValue(v string) string {
